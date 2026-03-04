@@ -145,7 +145,6 @@ async function startGameLoop() {
     await startNewGame();
     
     // Run game for random duration (based on crash point)
-    const runDuration = gameState.crashPoint * 1000; // 1 second per multiplier point
     const startTime = Date.now();
     gameState.startTime = startTime;
     
@@ -203,7 +202,7 @@ async function startNewGame() {
   console.log(`🎲 New game started - Crash Point: ${gameState.crashPoint}x, Total Bets: ${totalBetsAmount}`);
   
   // Place bot bets
-  placeBotBets();
+  placeBotBets(); // <-- ဒီနေရာမှာ ပြင်ပြီးပါပြီ
 }
 
 async function crashGame() {
@@ -340,8 +339,8 @@ async function processBetLoss(userId, bet) {
   );
 }
 
-// Bot functions
-function placeBotBots() {
+// Bot functions - FIXED: Function name changed from placeBotBots to placeBotBets
+function placeBotBets() {  // <-- ဒီနေရာမှာ placeBotBots မှ placeBotBets သို့ပြောင်းပြီး
   // Randomly select 5-10 bots to place bets
   const numBots = 5 + Math.floor(Math.random() * 5);
   const selectedBots = [...botUsers].sort(() => 0.5 - Math.random()).slice(0, numBots);
@@ -755,12 +754,14 @@ io.on('connection', (socket) => {
   
   // Handle cash out
   socket.on('cashOut', async (data, callback) => {
-    const result = await cashOut(socket.userId, data.multiplier);
+    // Get userId from socket handshake or data
+    const userId = socket.userId || data.userId;
+    const result = await cashOut(userId, data.multiplier);
     callback(result);
     
     if (result.success) {
       io.emit('cashout', {
-        userId: socket.userId,
+        userId: userId,
         multiplier: data.multiplier,
         profit: result.profit
       });
