@@ -714,146 +714,209 @@ bot.command('userinfo', async (ctx) => {
   }
 });
 
-// Handle WebApp data (deposit/withdraw)
-bot.on('message', async (ctx) => {
-  if (ctx.message.web_app_data) {
+// ============================================
+// NEW API ENDPOINTS FOR DEPOSIT/WITHDRAW (using fetch)
+// ============================================
+
+app.post('/api/deposit', async (req, res) => {
     try {
-      const data = JSON.parse(ctx.message.web_app_data.data);
-      console.log('📱 WebApp data received:', data);
-      
-      if (data.type === 'deposit') {
-        await handleDeposit(ctx, data);
-      } else if (data.type === 'withdraw') {
-        await handleWithdraw(ctx, data);
-      }
+        const { userId, username, name, phone, amount } = req.body;
+        console.log('📥 Deposit request:', { userId, username, name, phone, amount });
+
+        // Validate
+        if (!userId || !username || !name || !phone || !amount || amount < 3000) {
+            return res.status(400).json({ success: false, message: 'Invalid data or amount < 3000' });
+        }
+
+        // Save transaction
+        const transaction = await Transaction.create({
+            userId,
+            username,
+            type: 'deposit',
+            amount,
+            accountName: name,
+            accountNumber: phone,
+            status: 'pending'
+        });
+
+        // Notify each admin via bot
+        for (const adminId of ADMIN_IDS) {
+            try {
+                await bot.telegram.sendMessage(
+                    adminId,
+                    `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
+                    `👤 User: ${username}\n` +
+                    `🆔 ID: ${userId}\n` +
+                    `💵 ပမာဏ: ${amount} MMK\n` +
+                    `📝 နာမည်: ${name}\n` +
+                    `📞 ဖုန်း: ${phone}\n` +
+                    `🆔 Transaction ID: ${transaction._id}`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
+                                    { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
+                                ]
+                            ]
+                        }
+                    }
+                );
+            } catch (e) {
+                console.error(`Failed to send to admin ${adminId}:`, e);
+            }
+        }
+
+        res.json({ success: true, message: 'Deposit request received' });
     } catch (error) {
-      console.error('Error handling web_app_data:', error);
+        console.error('Deposit API error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
     }
+});
+
+app.post('/api/withdraw', async (req, res) => {
+    try {
+        const { userId, username, name, phone, amount } = req.body;
+        console.log('📤 Withdraw request:', { userId, username, name, phone, amount });
+
+        // Validate
+        if (!userId || !username || !name || !phone || !amount || amount <= 0) {
+            return res.status(400).json({ success: false, message: 'Invalid data' });
+        }
+
+        // Check user balance
+        const user = await User.findOne({ telegramId: userId });
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        if (user.balance < amount) {
+            return res.status(400).json({ success: false, message: 'Insufficient balance' });
+        }
+
+        // Save transaction (pending)
+        const transaction = await Transaction.create({
+            userId,
+            username,
+            type: 'withdraw',
+            amount,
+            accountName: name,
+            accountNumber: phone,
+            status: 'pending'
+        });
+
+        // Notify each admin
+        for (const adminId of ADMIN_IDS) {
+            try {
+                await bot.telegram.sendMessage(
+                    adminId,
+                    `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
+                    `👤 User: ${username}\n` +
+                    `🆔 ID: ${userId}\n` +
+                    `💵 ပမာဏ: ${amount} MMK\n` +
+                    `📝 နာမည်: ${name}\n` +
+                    `📞 ဖုန်း: ${phone}\n` +
+                    `💰 လက်ကျန်: ${user.balance} MMK\n` +
+                    `🆔 Transaction ID: ${transaction._id}`,
+                    {
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
+                                    { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
+                                ]
+                            ]
+                        }
+                    }
+                );
+            } catch (e) {
+                console.error(`Failed to send to admin ${adminId}:`, e);
+            }
+        }
+
+        res.json({ success: true, message: 'Withdraw request received' });
+    } catch (error) {
+        console.error('Withdraw API error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// API Routes
+app.post('/api/auth', async (req, res) => {
+  try {
+    const { id, username, first_name, last_name } = req.body;
+    
+    let user = await User.findOne({ telegramId: id.toString() });
+    
+    if (!user) {
+      user = await User.create({
+        telegramId: id.toString(),
+        username: username || `${first_name} ${last_name || ''}`.trim(),
+        firstName: first_name || '',
+        lastName: last_name || '',
+        balance: 1000
+      });
+    } else {
+      if (user.isBanned) {
+        return res.json({ 
+          success: false, 
+          message: 'Your account has been banned',
+          banned: true 
+        });
+      }
+      user.lastActive = new Date();
+      await user.save();
+    }
+    
+    res.json({
+      success: true,
+      user: {
+        id: user.telegramId,
+        username: user.username,
+        balance: user.balance,
+        totalDeposited: user.totalDeposited,
+        totalWithdrawn: user.totalWithdrawn
+      }
+    });
+  } catch (error) {
+    console.error('Auth error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-async function handleDeposit(ctx, data) {
-  const telegramId = ctx.from.id.toString();
-  const username = ctx.from.username || `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
-  
-  console.log('Processing deposit for:', { telegramId, username, data });
-  
+app.get('/api/balance/:userId', async (req, res) => {
   try {
-    const transaction = await Transaction.create({
-      userId: telegramId,
-      username,
-      type: 'deposit',
-      amount: data.amount,
-      accountName: data.name,
-      accountNumber: data.phone,
-      status: 'pending'
-    });
-    
-    console.log('Transaction created:', transaction._id);
-    
-    // Send to each admin directly
-    for (const adminId of ADMIN_IDS) {
-      try {
-        await ctx.telegram.sendMessage(
-          adminId,
-          `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
-          `👤 User: ${username}\n` +
-          `🆔 ID: ${telegramId}\n` +
-          `💵 ပမာဏ: ${data.amount} MMK\n` +
-          `📝 နာမည်: ${data.name}\n` +
-          `📞 ဖုန်း: ${data.phone}\n` +
-          `🆔 Transaction ID: ${transaction._id}`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
-                  { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
-                ]
-              ]
-            }
-          }
-        );
-      } catch (e) {
-        console.error(`Failed to send to admin ${adminId}:`, e);
-      }
-    }
-    
-    // Don't send confirmation to user here - modal already closed
-    console.log('Deposit request sent to admins');
-  } catch (error) {
-    console.error('Error in handleDeposit:', error);
-  }
-}
-
-async function handleWithdraw(ctx, data) {
-  const telegramId = ctx.from.id.toString();
-  const username = ctx.from.username || `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
-  
-  console.log('Processing withdraw for:', { telegramId, username, data });
-  
-  try {
-    const user = await User.findOne({ telegramId });
+    const user = await User.findOne({ telegramId: req.params.userId });
     if (!user) {
-      console.log('User not found');
-      return;
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
     
-    if (user.balance < data.amount) {
-      console.log('Insufficient balance');
-      return;
-    }
-    
-    const transaction = await Transaction.create({
-      userId: telegramId,
-      username,
-      type: 'withdraw',
-      amount: data.amount,
-      accountName: data.name,
-      accountNumber: data.phone,
-      status: 'pending'
+    res.json({
+      success: true,
+      balance: user.balance
     });
-    
-    console.log('Transaction created:', transaction._id);
-    
-    // Send to each admin directly
-    for (const adminId of ADMIN_IDS) {
-      try {
-        await ctx.telegram.sendMessage(
-          adminId,
-          `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
-          `👤 User: ${username}\n` +
-          `🆔 ID: ${telegramId}\n` +
-          `💵 ပမာဏ: ${data.amount} MMK\n` +
-          `📝 နာမည်: ${data.name}\n` +
-          `📞 ဖုန်း: ${data.phone}\n` +
-          `💰 လက်ကျန်: ${user.balance} MMK\n` +
-          `🆔 Transaction ID: ${transaction._id}`,
-          {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
-                  { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
-                ]
-              ]
-            }
-          }
-        );
-      } catch (e) {
-        console.error(`Failed to send to admin ${adminId}:`, e);
-      }
-    }
-    
-    console.log('Withdraw request sent to admins');
   } catch (error) {
-    console.error('Error in handleWithdraw:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
-}
+});
 
-// Admin callback handlers
+app.get('/api/history/:userId', async (req, res) => {
+  try {
+    const bets = await Bet.find({ userId: req.params.userId })
+      .sort({ createdAt: -1 })
+      .limit(20);
+    
+    res.json({
+      success: true,
+      history: bets
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// Admin callback handlers for transactions
 bot.action(/confirm_deposit_(.+)/, async (ctx) => {
   const transactionId = ctx.match[1];
   const adminUsername = ctx.from.username || ctx.from.first_name;
@@ -985,49 +1048,6 @@ bot.action(/reject_withdraw_(.+)/, async (ctx) => {
   } catch (error) {
     console.error('Error in reject_withdraw:', error);
     await ctx.answerCbQuery('Error processing request');
-  }
-});
-
-// API Routes
-app.post('/api/auth', async (req, res) => {
-  try {
-    const { id, username, first_name, last_name } = req.body;
-    
-    let user = await User.findOne({ telegramId: id.toString() });
-    
-    if (!user) {
-      user = await User.create({
-        telegramId: id.toString(),
-        username: username || `${first_name} ${last_name || ''}`.trim(),
-        firstName: first_name || '',
-        lastName: last_name || '',
-        balance: 1000
-      });
-    } else {
-      if (user.isBanned) {
-        return res.json({ 
-          success: false, 
-          message: 'Your account has been banned',
-          banned: true 
-        });
-      }
-      user.lastActive = new Date();
-      await user.save();
-    }
-    
-    res.json({
-      success: true,
-      user: {
-        id: user.telegramId,
-        username: user.username,
-        balance: user.balance,
-        totalDeposited: user.totalDeposited,
-        totalWithdrawn: user.totalWithdrawn
-      }
-    });
-  } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
