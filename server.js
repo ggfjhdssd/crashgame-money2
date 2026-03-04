@@ -29,9 +29,11 @@ app.use(express.urlencoded({ extended: true }));
 // Telegram Bot setup
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID;
+const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',') : [];
 
 console.log('Bot Token:', process.env.BOT_TOKEN ? '✅ Present' : '❌ Missing');
 console.log('Admin Group ID:', ADMIN_GROUP_ID ? '✅ Present' : '❌ Missing');
+console.log('Admin IDs:', ADMIN_IDS);
 
 // MongoDB connection
 mongoose.connect(process.env.MONGO_URI, {
@@ -54,6 +56,9 @@ const userSchema = new mongoose.Schema({
   totalWithdrawn: { type: Number, default: 0 },
   totalBets: { type: Number, default: 0 },
   totalWins: { type: Number, default: 0 },
+  isBanned: { type: Boolean, default: false },
+  bannedAt: Date,
+  banReason: String,
   createdAt: { type: Date, default: Date.now },
   lastActive: { type: Date, default: Date.now }
 });
@@ -76,8 +81,6 @@ const transactionSchema = new mongoose.Schema({
   type: { type: String, enum: ['deposit', 'withdraw'] },
   amount: Number,
   status: { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
-  screenshotUrl: String,
-  paymentMethod: String,
   accountName: String,
   accountNumber: String,
   adminNote: String,
@@ -99,40 +102,45 @@ let gameState = {
   startTime: null,
   totalBets: 0,
   bets: new Map(),
-  history: []
+  history: [],
+  countdown: null,
+  countdownInterval: null
 };
 
-// Bot users (Fake players)
+// Bot users (Fake players) with different cashout strategies
 const botUsers = [
-  { id: 'bot1', username: 'U Thu Ha', balance: 5000 },
-  { id: 'bot2', username: 'Kyaw Kyaw', balance: 3000 },
-  { id: 'bot3', username: 'Ma Ma Lay', balance: 7000 },
-  { id: 'bot4', username: 'Ko Ko Gyi', balance: 2500 },
-  { id: 'bot5', username: 'Daw Hla', balance: 4500 },
-  { id: 'bot6', username: 'Mg Mg Aung', balance: 6000 },
-  { id: 'bot7', username: 'Su Su Hlaing', balance: 3500 },
-  { id: 'bot8', username: 'Zaw Zaw', balance: 8000 },
-  { id: 'bot9', username: 'Aye Aye', balance: 2800 },
-  { id: 'bot10', username: 'Phyo Phyo', balance: 5200 }
+  { id: 'bot1', username: 'U Thu Ha', balance: 5000, strategy: 'early' },
+  { id: 'bot2', username: 'Kyaw Kyaw', balance: 3000, strategy: 'medium' },
+  { id: 'bot3', username: 'Ma Ma Lay', balance: 7000, strategy: 'late' },
+  { id: 'bot4', username: 'Ko Ko Gyi', balance: 2500, strategy: 'random' },
+  { id: 'bot5', username: 'Daw Hla', balance: 4500, strategy: 'early' },
+  { id: 'bot6', username: 'Mg Mg Aung', balance: 6000, strategy: 'medium' },
+  { id: 'bot7', username: 'Su Su Hlaing', balance: 3500, strategy: 'late' },
+  { id: 'bot8', username: 'Zaw Zaw', balance: 8000, strategy: 'random' },
+  { id: 'bot9', username: 'Aye Aye', balance: 2800, strategy: 'early' },
+  { id: 'bot10', username: 'Phyo Phyo', balance: 5200, strategy: 'medium' }
 ];
 
-// Helper function to generate crash point
+// Helper function to generate crash point (max 20.0x)
 function generateCrashPoint(totalBets) {
   let crashPoint;
   
   if (totalBets > 10000) {
-    crashPoint = 1.1 + (Math.random() * 0.4);
+    crashPoint = 1.1 + (Math.random() * 0.9); // 1.1x - 2.0x
   } else if (totalBets > 5000) {
-    crashPoint = 1.2 + (Math.random() * 1.3);
+    crashPoint = 1.2 + (Math.random() * 2.8); // 1.2x - 4.0x
+  } else if (totalBets > 2000) {
+    crashPoint = 1.5 + (Math.random() * 5.5); // 1.5x - 7.0x
   } else {
-    if (Math.random() < 0.2) {
-      crashPoint = 5 + (Math.random() * 15);
+    if (Math.random() < 0.3) {
+      crashPoint = 5 + (Math.random() * 15); // 5x - 20x
     } else {
-      crashPoint = 1.1 + (Math.random() * 3.9);
+      crashPoint = 1.1 + (Math.random() * 3.9); // 1.1x - 5x
     }
   }
   
-  return Math.round(crashPoint * 100) / 100;
+  // Ensure max is 20.0x
+  return Math.min(20.0, Math.round(crashPoint * 100) / 100);
 }
 
 // Game Loop
@@ -140,6 +148,10 @@ async function startGameLoop() {
   console.log('🎮 Starting game loop...');
   
   while (true) {
+    // Start countdown
+    await startCountdown();
+    
+    // Start new game
     await startNewGame();
     
     const startTime = Date.now();
@@ -175,6 +187,26 @@ async function startGameLoop() {
   }
 }
 
+async function startCountdown() {
+  return new Promise((resolve) => {
+    let count = 3;
+    
+    io.emit('countdown', { seconds: count });
+    
+    gameState.countdownInterval = setInterval(() => {
+      count--;
+      
+      if (count > 0) {
+        io.emit('countdown', { seconds: count });
+      } else {
+        clearInterval(gameState.countdownInterval);
+        io.emit('gameStart', {});
+        resolve();
+      }
+    }, 1000);
+  });
+}
+
 async function startNewGame() {
   const totalBetsAmount = Array.from(gameState.bets.values())
     .reduce((sum, bet) => sum + bet.amount, 0);
@@ -194,7 +226,6 @@ async function startNewGame() {
   
   placeBotBets();
   
-  // Send active bets to all clients
   const activeBets = Array.from(gameState.bets.values()).map(bet => ({
     username: bet.username,
     amount: bet.amount,
@@ -230,17 +261,21 @@ async function crashGame() {
 // Bet processing functions
 async function placeBet(userId, username, amount) {
   try {
-    if (!gameState.isRunning) {
-      return { success: false, message: 'Game is not running' };
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) {
+      return { success: false, message: 'User not found' };
+    }
+    
+    if (user.isBanned) {
+      return { success: false, message: 'Your account has been banned' };
+    }
+    
+    if (!gameState.isRunning && gameState.countdownInterval) {
+      return { success: false, message: 'Please wait for countdown' };
     }
     
     if (gameState.bets.has(userId)) {
       return { success: false, message: 'You already have an active bet' };
-    }
-    
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) {
-      return { success: false, message: 'User not found' };
     }
     
     if (user.balance < amount) {
@@ -275,7 +310,6 @@ async function placeBet(userId, username, amount) {
     
     io.emit('balanceUpdate', { userId, balance: user.balance });
     
-    // Update active bets for all clients
     const activeBets = Array.from(gameState.bets.values()).map(b => ({
       username: b.username,
       amount: b.amount,
@@ -334,7 +368,6 @@ async function cashOut(userId, multiplier) {
         userId 
       });
       
-      // Add to history
       io.emit('newHistory', {
         username: bet.username,
         start: 1.0,
@@ -343,7 +376,6 @@ async function cashOut(userId, multiplier) {
         isBot: bet.isBot || false
       });
       
-      // Update active bets
       const activeBets = Array.from(gameState.bets.values())
         .filter(b => !b.cashedAt)
         .map(b => ({
@@ -381,7 +413,7 @@ async function processBetLoss(userId, bet) {
   });
 }
 
-// Bot functions
+// Bot functions with different strategies
 function placeBotBets() {
   const numBots = 5 + Math.floor(Math.random() * 5);
   const selectedBots = [...botUsers].sort(() => 0.5 - Math.random()).slice(0, numBots);
@@ -396,11 +428,12 @@ function placeBotBets() {
         amount: betAmount,
         placedAt: Date.now(),
         gameId: gameState.gameId,
-        isBot: true
+        isBot: true,
+        strategy: bot.strategy
       });
       gameState.totalBets += betAmount;
       
-      console.log(`🤖 Bot ${bot.username} placed bet: ${betAmount}`);
+      console.log(`🤖 Bot ${bot.username} (${bot.strategy}) placed bet: ${betAmount}`);
     }
   });
 }
@@ -408,31 +441,45 @@ function placeBotBets() {
 function processBotCashouts() {
   for (const [userId, bet] of gameState.bets.entries()) {
     if (bet.isBot && !bet.cashedAt) {
-      const cashoutChance = 0.05;
-      if (Math.random() < cashoutChance) {
-        const cashoutMultiplier = gameState.currentMultiplier;
+      const currentMultiplier = gameState.currentMultiplier;
+      let shouldCashout = false;
+      
+      // Different strategies for different bots
+      switch(bet.strategy) {
+        case 'early':
+          shouldCashout = currentMultiplier > 1.2 && currentMultiplier < 2.0 && Math.random() < 0.3;
+          break;
+        case 'medium':
+          shouldCashout = currentMultiplier > 2.0 && currentMultiplier < 4.0 && Math.random() < 0.2;
+          break;
+        case 'late':
+          shouldCashout = currentMultiplier > 4.0 && currentMultiplier < 8.0 && Math.random() < 0.15;
+          break;
+        case 'random':
+          shouldCashout = Math.random() < 0.1; // Random chance at any time
+          break;
+      }
+      
+      if (shouldCashout) {
+        const profit = bet.amount * (currentMultiplier - 1);
+        bet.cashedAt = Date.now();
+        bet.cashoutMultiplier = currentMultiplier;
+        bet.profit = profit;
         
-        if (cashoutMultiplier > 1.1 && Math.random() < 0.5) {
-          const profit = bet.amount * (cashoutMultiplier - 1);
-          bet.cashedAt = Date.now();
-          bet.cashoutMultiplier = cashoutMultiplier;
-          bet.profit = profit;
-          
-          const bot = botUsers.find(b => b.id === userId);
-          if (bot) {
-            bot.balance += bet.amount + profit;
-          }
-          
-          console.log(`🤖 Bot ${bet.username} cashed out at ${cashoutMultiplier}x`);
-          
-          io.emit('newHistory', {
-            username: bet.username,
-            start: 1.0,
-            stop: cashoutMultiplier,
-            profit: profit,
-            isBot: true
-          });
+        const bot = botUsers.find(b => b.id === userId);
+        if (bot) {
+          bot.balance += bet.amount + profit;
         }
+        
+        console.log(`🤖 Bot ${bet.username} (${bet.strategy}) cashed out at ${currentMultiplier}x`);
+        
+        io.emit('newHistory', {
+          username: bet.username,
+          start: 1.0,
+          stop: currentMultiplier,
+          profit: profit,
+          isBot: true
+        });
       }
     }
   }
@@ -462,6 +509,11 @@ bot.start(async (ctx) => {
         `ဂိမ်းစတင်ဆော့ကစားရန် အောက်ပါကိုနှိပ်ပါ။`
       );
     } else {
+      if (user.isBanned) {
+        await ctx.reply('❌ သင့်အကောင့်ကို ပိတ်ပင်ထားပါသည်။');
+        return;
+      }
+      
       await ctx.reply(
         `ပြန်လည်ကြိုဆိုပါတယ် ${username}!\n` +
         `သင့်လက်ကျန်ငွေ: ${user.balance} MMK`
@@ -481,7 +533,188 @@ bot.start(async (ctx) => {
   }
 });
 
-// Handle WebApp data
+// Admin commands
+bot.command('balance', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+    return ctx.reply('❌ သင် Admin မဟုတ်ပါ။');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 3) {
+    return ctx.reply('Usage: /balance <user_id> <add/deduct> <amount>');
+  }
+  
+  const targetId = args[1];
+  const action = args[2];
+  const amount = parseFloat(args[3]);
+  
+  if (isNaN(amount) || amount <= 0) {
+    return ctx.reply('❌ ငွေပမာဏ မှန်ကန်စွာထည့်ပါ။');
+  }
+  
+  try {
+    const user = await User.findOne({ telegramId: targetId });
+    if (!user) {
+      return ctx.reply('❌ User မတွေ့ပါ။');
+    }
+    
+    if (action === 'add') {
+      user.balance += amount;
+      user.totalDeposited += amount;
+      await user.save();
+      
+      await ctx.telegram.sendMessage(
+        targetId,
+        `✅ သင့်အကောင့်ထဲသို့ ${amount} MMK ထည့်ပေးလိုက်ပါသည်။\nလက်ကျန်အသစ်: ${user.balance} MMK`
+      );
+      
+      io.emit('balanceUpdate', { userId: targetId, balance: user.balance });
+      
+      await ctx.reply(`✅ ${targetId} အကောင့်ထဲသို့ ${amount} MMK ထည့်ပြီးပါပြီ။`);
+    } else if (action === 'deduct') {
+      if (user.balance < amount) {
+        return ctx.reply('❌ User ရဲ့ လက်ကျန်ငေ မလုံလောက်ပါ။');
+      }
+      
+      user.balance -= amount;
+      user.totalWithdrawn += amount;
+      await user.save();
+      
+      await ctx.telegram.sendMessage(
+        targetId,
+        `ℹ️ သင့်အကောင့်မှ ${amount} MMK နုတ်ယူလိုက်ပါသည်။\nလက်ကျန်အသစ်: ${user.balance} MMK`
+      );
+      
+      io.emit('balanceUpdate', { userId: targetId, balance: user.balance });
+      
+      await ctx.reply(`✅ ${targetId} အကောင့်မှ ${amount} MMK နုတ်ပြီးပါပြီ။`);
+    } else {
+      await ctx.reply('Invalid action. Use add or deduct');
+    }
+  } catch (error) {
+    console.error('Admin balance error:', error);
+    await ctx.reply('❌ အမှားဖြစ်သွားပါသည်။');
+  }
+});
+
+bot.command('ban', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+    return ctx.reply('❌ သင် Admin မဟုတ်ပါ။');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 3) {
+    return ctx.reply('Usage: /ban <user_id> <reason>');
+  }
+  
+  const targetId = args[1];
+  const reason = args.slice(2).join(' ');
+  
+  try {
+    const user = await User.findOne({ telegramId: targetId });
+    if (!user) {
+      return ctx.reply('❌ User မတွေ့ပါ။');
+    }
+    
+    user.isBanned = true;
+    user.bannedAt = new Date();
+    user.banReason = reason;
+    await user.save();
+    
+    await ctx.telegram.sendMessage(
+      targetId,
+      `❌ သင့်အကောင့်ကို ပိတ်ပင်ထားပါသည်။\nအကြောင်းရင်း: ${reason}`
+    );
+    
+    await ctx.reply(`✅ User ${targetId} ကို Ban လိုက်ပါပြီ။`);
+  } catch (error) {
+    console.error('Admin ban error:', error);
+    await ctx.reply('❌ အမှားဖြစ်သွားပါသည်။');
+  }
+});
+
+bot.command('unban', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+    return ctx.reply('❌ သင် Admin မဟုတ်ပါ။');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /unban <user_id>');
+  }
+  
+  const targetId = args[1];
+  
+  try {
+    const user = await User.findOne({ telegramId: targetId });
+    if (!user) {
+      return ctx.reply('❌ User မတွေ့ပါ။');
+    }
+    
+    user.isBanned = false;
+    user.banReason = null;
+    await user.save();
+    
+    await ctx.telegram.sendMessage(
+      targetId,
+      `✅ သင့်အကောင့်ကို ပြန်ဖွင့်ပေးလိုက်ပါပြီ။`
+    );
+    
+    await ctx.reply(`✅ User ${targetId} ကို Unban လိုက်ပါပြီ။`);
+  } catch (error) {
+    console.error('Admin unban error:', error);
+    await ctx.reply('❌ အမှားဖြစ်သွားပါသည်။');
+  }
+});
+
+bot.command('userinfo', async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+    return ctx.reply('❌ သင် Admin မဟုတ်ပါ။');
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length < 2) {
+    return ctx.reply('Usage: /userinfo <user_id>');
+  }
+  
+  const targetId = args[1];
+  
+  try {
+    const user = await User.findOne({ telegramId: targetId });
+    if (!user) {
+      return ctx.reply('❌ User မတွေ့ပါ။');
+    }
+    
+    const recentBets = await Bet.find({ userId: targetId })
+      .sort({ startedAt: -1 })
+      .limit(5);
+    
+    let betsInfo = '';
+    recentBets.forEach((bet, i) => {
+      betsInfo += `${i+1}. ${bet.amount} MMK - ${bet.status} ${bet.cashoutMultiplier ? `@ ${bet.cashoutMultiplier}x` : ''}\n`;
+    });
+    
+    await ctx.reply(
+      `👤 *User Information*\n\n` +
+      `ID: ${user.telegramId}\n` +
+      `Username: ${user.username}\n` +
+      `Balance: ${user.balance} MMK\n` +
+      `Status: ${user.isBanned ? '❌ Banned' : '✅ Active'}\n` +
+      `Total Bets: ${user.totalBets}\n` +
+      `Total Wins: ${user.totalWins}\n` +
+      `Win Rate: ${user.totalBets > 0 ? Math.round((user.totalWins/user.totalBets)*100) : 0}%\n` +
+      `Deposited: ${user.totalDeposited} MMK\n` +
+      `Withdrawn: ${user.totalWithdrawn} MMK\n\n` +
+      `*Recent Bets:*\n${betsInfo || 'No bets yet'}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('Admin userinfo error:', error);
+    await ctx.reply('❌ အမှားဖြစ်သွားပါသည်။');
+  }
+});
+
+// Handle WebApp data (deposit/withdraw)
 bot.on('message', async (ctx) => {
   if (ctx.message.web_app_data) {
     try {
@@ -511,43 +744,46 @@ async function handleDeposit(ctx, data) {
       username,
       type: 'deposit',
       amount: data.amount,
-      screenshotUrl: data.screenshotUrl || 'manual',
-      paymentMethod: data.paymentMethod || 'KPay',
+      accountName: data.name,
+      accountNumber: data.phone,
       status: 'pending'
     });
     
     console.log('Transaction created:', transaction._id);
     
-    if (ADMIN_GROUP_ID) {
-      await ctx.telegram.sendMessage(
-        ADMIN_GROUP_ID,
-        `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
-        `👤 User: ${username}\n` +
-        `🆔 ID: ${telegramId}\n` +
-        `💵 ပမာဏ: ${data.amount} MMK\n` +
-        `💳 ငွေသွင်းနည်း: ${data.paymentMethod}\n` +
-        `🆔 Transaction ID: ${transaction._id}`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
-                { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
+    // Send to each admin directly
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await ctx.telegram.sendMessage(
+          adminId,
+          `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
+          `👤 User: ${username}\n` +
+          `🆔 ID: ${telegramId}\n` +
+          `💵 ပမာဏ: ${data.amount} MMK\n` +
+          `📝 နာမည်: ${data.name}\n` +
+          `📞 ဖုန်း: ${data.phone}\n` +
+          `🆔 Transaction ID: ${transaction._id}`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
+                  { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
+                ]
               ]
-            ]
+            }
           }
-        }
-      );
-      console.log('Admin notification sent');
-    } else {
-      console.log('ADMIN_GROUP_ID not set');
+        );
+      } catch (e) {
+        console.error(`Failed to send to admin ${adminId}:`, e);
+      }
     }
     
-    await ctx.reply('✅ ငွေသွင်းရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin အတည်ပြုပြီးပါက ငွေလက်ကျန်ထဲသို့ ထည့်ပေးပါမည်။');
+    // Don't send confirmation to user here - modal already closed
+    console.log('Deposit request sent to admins');
   } catch (error) {
     console.error('Error in handleDeposit:', error);
-    await ctx.reply('စနစ်ကျသင့်မှုတစ်ခုဖြစ်ပွားခဲ့ပါသည်။');
   }
 }
 
@@ -560,12 +796,12 @@ async function handleWithdraw(ctx, data) {
   try {
     const user = await User.findOne({ telegramId });
     if (!user) {
-      await ctx.reply('အကောင့်မရှိပါ။');
+      console.log('User not found');
       return;
     }
     
     if (user.balance < data.amount) {
-      await ctx.reply('လက်ကျန်ငွေ မလုံလောက်ပါ။');
+      console.log('Insufficient balance');
       return;
     }
     
@@ -574,43 +810,46 @@ async function handleWithdraw(ctx, data) {
       username,
       type: 'withdraw',
       amount: data.amount,
-      accountName: data.accountName,
-      accountNumber: data.accountNumber,
+      accountName: data.name,
+      accountNumber: data.phone,
       status: 'pending'
     });
     
     console.log('Transaction created:', transaction._id);
     
-    if (ADMIN_GROUP_ID) {
-      await ctx.telegram.sendMessage(
-        ADMIN_GROUP_ID,
-        `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
-        `👤 User: ${username}\n` +
-        `🆔 ID: ${telegramId}\n` +
-        `💵 ပမာဏ: ${data.amount} MMK\n` +
-        `🏦 KPay နံပါတ်: ${data.accountNumber}\n` +
-        `📝 နာမည်: ${data.accountName}\n` +
-        `🆔 Transaction ID: ${transaction._id}\n` +
-        `💰 လက်ကျန်: ${user.balance} MMK`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
-                { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
+    // Send to each admin directly
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await ctx.telegram.sendMessage(
+          adminId,
+          `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
+          `👤 User: ${username}\n` +
+          `🆔 ID: ${telegramId}\n` +
+          `💵 ပမာဏ: ${data.amount} MMK\n` +
+          `📝 နာမည်: ${data.name}\n` +
+          `📞 ဖုန်း: ${data.phone}\n` +
+          `💰 လက်ကျန်: ${user.balance} MMK\n` +
+          `🆔 Transaction ID: ${transaction._id}`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
+                  { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
+                ]
               ]
-            ]
+            }
           }
-        }
-      );
-      console.log('Admin notification sent');
+        );
+      } catch (e) {
+        console.error(`Failed to send to admin ${adminId}:`, e);
+      }
     }
     
-    await ctx.reply('✅ ငွေထုတ်ရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin ငွေလွှဲပြီးပါက အတည်ပြုပေးပါမည်။');
+    console.log('Withdraw request sent to admins');
   } catch (error) {
     console.error('Error in handleWithdraw:', error);
-    await ctx.reply('စနစ်ကျသင့်မှုတစ်ခုဖြစ်ပွားခဲ့ပါသည်။');
   }
 }
 
@@ -655,6 +894,33 @@ bot.action(/confirm_deposit_(.+)/, async (ctx) => {
   }
 });
 
+bot.action(/reject_deposit_(.+)/, async (ctx) => {
+  const transactionId = ctx.match[1];
+  
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      await ctx.answerCbQuery('Transaction not found');
+      return;
+    }
+    
+    transaction.status = 'rejected';
+    await transaction.save();
+    
+    await ctx.telegram.sendMessage(
+      transaction.userId,
+      `❌ ငွေသွင်းတောင်းဆိုချက် ငြင်းပယ်ခံရပါသည်။\n` +
+      `ကျေးဇူးပြု၍ ပြန်လည်ဆက်သွယ်ပါ။`
+    );
+    
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    await ctx.answerCbQuery('❌ Deposit rejected');
+  } catch (error) {
+    console.error('Error in reject_deposit:', error);
+    await ctx.answerCbQuery('Error processing request');
+  }
+});
+
 bot.action(/confirm_withdraw_(.+)/, async (ctx) => {
   const transactionId = ctx.match[1];
   const adminUsername = ctx.from.username || ctx.from.first_name;
@@ -695,6 +961,33 @@ bot.action(/confirm_withdraw_(.+)/, async (ctx) => {
   }
 });
 
+bot.action(/reject_withdraw_(.+)/, async (ctx) => {
+  const transactionId = ctx.match[1];
+  
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      await ctx.answerCbQuery('Transaction not found');
+      return;
+    }
+    
+    transaction.status = 'rejected';
+    await transaction.save();
+    
+    await ctx.telegram.sendMessage(
+      transaction.userId,
+      `❌ ငွေထုတ်တောင်းဆိုချက် ငြင်းပယ်ခံရပါသည်။\n` +
+      `ကျေးဇူးပြု၍ ပြန်လည်ဆက်သွယ်ပါ။`
+    );
+    
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+    await ctx.answerCbQuery('❌ Withdraw rejected');
+  } catch (error) {
+    console.error('Error in reject_withdraw:', error);
+    await ctx.answerCbQuery('Error processing request');
+  }
+});
+
 // API Routes
 app.post('/api/auth', async (req, res) => {
   try {
@@ -711,6 +1004,13 @@ app.post('/api/auth', async (req, res) => {
         balance: 1000
       });
     } else {
+      if (user.isBanned) {
+        return res.json({ 
+          success: false, 
+          message: 'Your account has been banned',
+          banned: true 
+        });
+      }
       user.lastActive = new Date();
       await user.save();
     }
