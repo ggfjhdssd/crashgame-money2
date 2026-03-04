@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf } = require('telegraf');
 
 // Load environment variables
 dotenv.config();
@@ -15,8 +15,10 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling']
 });
 
 // Middleware
@@ -27,6 +29,9 @@ app.use(express.urlencoded({ extended: true }));
 // Telegram Bot setup
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_GROUP_ID = process.env.ADMIN_GROUP_ID;
+
+console.log('Bot Token:', process.env.BOT_TOKEN ? '✅ Present' : '❌ Missing');
+console.log('Admin Group ID:', ADMIN_GROUP_ID ? '✅ Present' : '❌ Missing');
 
 // MongoDB connection
 mongoose.connect(process.env.MONGO_URI, {
@@ -44,7 +49,7 @@ const userSchema = new mongoose.Schema({
   username: String,
   firstName: String,
   lastName: String,
-  balance: { type: Number, default: 1000 }, // Starting balance
+  balance: { type: Number, default: 1000 },
   totalDeposited: { type: Number, default: 0 },
   totalWithdrawn: { type: Number, default: 0 },
   totalBets: { type: Number, default: 0 },
@@ -93,7 +98,7 @@ let gameState = {
   gameId: null,
   startTime: null,
   totalBets: 0,
-  bets: new Map(), // Store active bets
+  bets: new Map(),
   history: []
 };
 
@@ -111,25 +116,19 @@ const botUsers = [
   { id: 'bot10', username: 'Phyo Phyo', balance: 5200 }
 ];
 
-// Helper function to generate crash point based on total bets
+// Helper function to generate crash point
 function generateCrashPoint(totalBets) {
-  // Base crash point calculation
   let crashPoint;
   
-  // If total bets are high, force low crash point for admin profit
   if (totalBets > 10000) {
-    // Force low crash point between 1.1x and 1.5x
     crashPoint = 1.1 + (Math.random() * 0.4);
   } else if (totalBets > 5000) {
-    // Medium range
-    crashPoint = 1.2 + (Math.random() * 1.3); // 1.2x - 2.5x
+    crashPoint = 1.2 + (Math.random() * 1.3);
   } else {
-    // Low bets - allow high multipliers to attract players
-    // 80% chance of low multiplier, 20% chance of high multiplier
     if (Math.random() < 0.2) {
-      crashPoint = 5 + (Math.random() * 15); // 5x - 20x
+      crashPoint = 5 + (Math.random() * 15);
     } else {
-      crashPoint = 1.1 + (Math.random() * 3.9); // 1.1x - 5x
+      crashPoint = 1.1 + (Math.random() * 3.9);
     }
   }
   
@@ -141,39 +140,32 @@ async function startGameLoop() {
   console.log('🎮 Starting game loop...');
   
   while (true) {
-    // Start new game
     await startNewGame();
     
-    // Run game for random duration (based on crash point)
     const startTime = Date.now();
     gameState.startTime = startTime;
     
-    // Update multiplier in real-time
     while (gameState.isRunning) {
       const elapsedSeconds = (Date.now() - startTime) / 1000;
-      const currentMultiplier = 1.0 + (elapsedSeconds * 0.1); // Increase by 0.1x per second
+      const currentMultiplier = 1.0 + (elapsedSeconds * 0.1);
       
       if (currentMultiplier >= gameState.crashPoint) {
-        // Game crashed
         await crashGame();
         break;
       }
       
       gameState.currentMultiplier = Math.round(currentMultiplier * 100) / 100;
       
-      // Broadcast multiplier to all clients
       io.emit('multiplier', {
         multiplier: gameState.currentMultiplier,
         gameState: 'running'
       });
       
-      // Check bot cashouts
       processBotCashouts();
       
-      await sleep(100); // Update every 100ms
+      await sleep(100);
     }
     
-    // Wait 3 seconds before next game
     io.emit('multiplier', {
       multiplier: 0,
       gameState: 'waiting'
@@ -184,7 +176,6 @@ async function startGameLoop() {
 }
 
 async function startNewGame() {
-  // Calculate total bets for this round
   const totalBetsAmount = Array.from(gameState.bets.values())
     .reduce((sum, bet) => sum + bet.amount, 0);
   
@@ -196,13 +187,20 @@ async function startNewGame() {
     startTime: Date.now(),
     totalBets: totalBetsAmount,
     bets: new Map(),
-    history: gameState.history.slice(0, 20) // Keep last 20 games
+    history: gameState.history.slice(0, 20)
   };
   
   console.log(`🎲 New game started - Crash Point: ${gameState.crashPoint}x, Total Bets: ${totalBetsAmount}`);
   
-  // Place bot bets
-  placeBotBets(); // <-- ဒီနေရာမှာ ပြင်ပြီးပါပြီ
+  placeBotBets();
+  
+  // Send active bets to all clients
+  const activeBets = Array.from(gameState.bets.values()).map(bet => ({
+    username: bet.username,
+    amount: bet.amount,
+    isBot: bet.isBot || false
+  }));
+  io.emit('activeBets', { bets: activeBets });
 }
 
 async function crashGame() {
@@ -210,15 +208,12 @@ async function crashGame() {
   
   console.log(`💥 Game crashed at ${gameState.crashPoint}x`);
   
-  // Process all pending bets (lost)
   for (const [userId, bet] of gameState.bets.entries()) {
     if (!bet.cashedAt) {
-      // User didn't cash out - lost bet
       await processBetLoss(userId, bet);
     }
   }
   
-  // Save game to history
   gameState.history.unshift({
     gameId: gameState.gameId,
     crashPoint: gameState.crashPoint,
@@ -226,7 +221,6 @@ async function crashGame() {
     timestamp: new Date()
   });
   
-  // Emit crash event
   io.emit('gameCrashed', {
     multiplier: gameState.crashPoint,
     gameId: gameState.gameId
@@ -235,101 +229,141 @@ async function crashGame() {
 
 // Bet processing functions
 async function placeBet(userId, username, amount) {
-  if (!gameState.isRunning) {
-    return { success: false, message: 'Game is not running' };
+  try {
+    if (!gameState.isRunning) {
+      return { success: false, message: 'Game is not running' };
+    }
+    
+    if (gameState.bets.has(userId)) {
+      return { success: false, message: 'You already have an active bet' };
+    }
+    
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) {
+      return { success: false, message: 'User not found' };
+    }
+    
+    if (user.balance < amount) {
+      return { success: false, message: 'Insufficient balance' };
+    }
+    
+    user.balance -= amount;
+    user.totalBets += 1;
+    await user.save();
+    
+    const bet = {
+      userId,
+      username,
+      amount,
+      placedAt: Date.now(),
+      gameId: gameState.gameId,
+      isBot: false
+    };
+    
+    gameState.bets.set(userId, bet);
+    gameState.totalBets += amount;
+    
+    await Bet.create({
+      userId,
+      username,
+      amount,
+      gameId: gameState.gameId,
+      status: 'pending'
+    });
+    
+    gameState.crashPoint = generateCrashPoint(gameState.totalBets);
+    
+    io.emit('balanceUpdate', { userId, balance: user.balance });
+    
+    // Update active bets for all clients
+    const activeBets = Array.from(gameState.bets.values()).map(b => ({
+      username: b.username,
+      amount: b.amount,
+      isBot: b.isBot || false
+    }));
+    io.emit('activeBets', { bets: activeBets });
+    
+    return { success: true, message: 'Bet placed successfully', newBalance: user.balance };
+  } catch (error) {
+    console.error('placeBet error:', error);
+    return { success: false, message: 'Server error' };
   }
-  
-  // Check if user already has a bet
-  if (gameState.bets.has(userId)) {
-    return { success: false, message: 'You already have an active bet' };
-  }
-  
-  // Check user balance
-  const user = await User.findOne({ telegramId: userId });
-  if (!user || user.balance < amount) {
-    return { success: false, message: 'Insufficient balance' };
-  }
-  
-  // Deduct balance
-  user.balance -= amount;
-  user.totalBets += 1;
-  await user.save();
-  
-  // Create bet record
-  const bet = {
-    userId,
-    username,
-    amount,
-    placedAt: Date.now(),
-    gameId: gameState.gameId
-  };
-  
-  gameState.bets.set(userId, bet);
-  gameState.totalBets += amount;
-  
-  // Save to database
-  await Bet.create({
-    userId,
-    username,
-    amount,
-    gameId: gameState.gameId,
-    status: 'pending'
-  });
-  
-  // Update game crash point based on new total
-  gameState.crashPoint = generateCrashPoint(gameState.totalBets);
-  
-  io.emit('balanceUpdate', { userId, balance: user.balance });
-  
-  return { success: true, message: 'Bet placed successfully' };
 }
 
 async function cashOut(userId, multiplier) {
-  const bet = gameState.bets.get(userId);
-  
-  if (!bet || bet.cashedAt) {
-    return { success: false, message: 'No active bet found' };
-  }
-  
-  if (!gameState.isRunning) {
-    return { success: false, message: 'Game has crashed' };
-  }
-  
-  // Calculate profit
-  const profit = bet.amount * (multiplier - 1);
-  const totalReturn = bet.amount + profit;
-  
-  // Update user balance
-  const user = await User.findOne({ telegramId: userId });
-  if (user) {
-    user.balance += totalReturn;
-    user.totalWins += 1;
-    await user.save();
+  try {
+    const bet = gameState.bets.get(userId);
     
-    // Update bet record
-    await Bet.findOneAndUpdate(
-      { userId, gameId: gameState.gameId },
-      {
-        cashoutMultiplier: multiplier,
+    if (!bet || bet.cashedAt) {
+      return { success: false, message: 'No active bet found' };
+    }
+    
+    if (!gameState.isRunning) {
+      return { success: false, message: 'Game has crashed' };
+    }
+    
+    const profit = bet.amount * (multiplier - 1);
+    const totalReturn = bet.amount + profit;
+    
+    const user = await User.findOne({ telegramId: userId });
+    if (user) {
+      user.balance += totalReturn;
+      user.totalWins += 1;
+      await user.save();
+      
+      await Bet.findOneAndUpdate(
+        { userId, gameId: gameState.gameId },
+        {
+          cashoutMultiplier: multiplier,
+          profit: profit,
+          status: 'won',
+          cashedAt: new Date()
+        }
+      );
+      
+      bet.cashedAt = Date.now();
+      bet.cashoutMultiplier = multiplier;
+      bet.profit = profit;
+      
+      io.emit('balanceUpdate', { userId, balance: user.balance });
+      io.emit('betResult', { 
+        success: true, 
+        type: 'cashout', 
+        multiplier, 
+        profit,
+        userId 
+      });
+      
+      // Add to history
+      io.emit('newHistory', {
+        username: bet.username,
+        start: 1.0,
+        stop: multiplier,
         profit: profit,
-        status: 'won',
-        cashedAt: new Date()
-      }
-    );
+        isBot: bet.isBot || false
+      });
+      
+      // Update active bets
+      const activeBets = Array.from(gameState.bets.values())
+        .filter(b => !b.cashedAt)
+        .map(b => ({
+          username: b.username,
+          amount: b.amount,
+          isBot: b.isBot || false
+        }));
+      io.emit('activeBets', { bets: activeBets });
+    }
     
-    bet.cashedAt = Date.now();
-    bet.cashoutMultiplier = multiplier;
-    bet.profit = profit;
-    
-    io.emit('balanceUpdate', { userId, balance: user.balance });
+    return {
+      success: true,
+      multiplier,
+      profit,
+      newBalance: user?.balance
+    };
+  } catch (error) {
+    console.error('cashOut error:', error);
+    return { success: false, message: 'Server error' };
   }
-  
-  return {
-    success: true,
-    multiplier,
-    profit,
-    newBalance: user?.balance
-  };
 }
 
 async function processBetLoss(userId, bet) {
@@ -337,16 +371,23 @@ async function processBetLoss(userId, bet) {
     { userId, gameId: gameState.gameId },
     { status: 'lost' }
   );
+  
+  io.emit('newHistory', {
+    username: bet.username,
+    start: 1.0,
+    stop: gameState.crashPoint,
+    profit: -bet.amount,
+    isBot: bet.isBot || false
+  });
 }
 
-// Bot functions - FIXED: Function name changed from placeBotBots to placeBotBets
-function placeBotBets() {  // <-- ဒီနေရာမှာ placeBotBots မှ placeBotBets သို့ပြောင်းပြီး
-  // Randomly select 5-10 bots to place bets
+// Bot functions
+function placeBotBets() {
   const numBots = 5 + Math.floor(Math.random() * 5);
   const selectedBots = [...botUsers].sort(() => 0.5 - Math.random()).slice(0, numBots);
   
   selectedBots.forEach(bot => {
-    const betAmount = Math.floor(Math.random() * 1000) + 100; // 100-1100
+    const betAmount = Math.floor(Math.random() * 1000) + 100;
     if (bot.balance >= betAmount) {
       bot.balance -= betAmount;
       gameState.bets.set(bot.id, {
@@ -365,29 +406,32 @@ function placeBotBets() {  // <-- ဒီနေရာမှာ placeBotBots မ�
 }
 
 function processBotCashouts() {
-  // Bots randomly decide to cash out based on current multiplier
   for (const [userId, bet] of gameState.bets.entries()) {
     if (bet.isBot && !bet.cashedAt) {
-      // Bot cashout logic
-      const cashoutChance = 0.1; // 10% chance per update
+      const cashoutChance = 0.05;
       if (Math.random() < cashoutChance) {
         const cashoutMultiplier = gameState.currentMultiplier;
         
-        // Some bots cash out early, some late
-        if (cashoutMultiplier > 1.2 && Math.random() < 0.7) {
-          // Cash out
+        if (cashoutMultiplier > 1.1 && Math.random() < 0.5) {
           const profit = bet.amount * (cashoutMultiplier - 1);
           bet.cashedAt = Date.now();
           bet.cashoutMultiplier = cashoutMultiplier;
           bet.profit = profit;
           
-          // Find bot and update balance
           const bot = botUsers.find(b => b.id === userId);
           if (bot) {
             bot.balance += bet.amount + profit;
           }
           
           console.log(`🤖 Bot ${bet.username} cashed out at ${cashoutMultiplier}x`);
+          
+          io.emit('newHistory', {
+            username: bet.username,
+            start: 1.0,
+            stop: cashoutMultiplier,
+            profit: profit,
+            isBot: true
+          });
         }
       }
     }
@@ -408,14 +452,14 @@ bot.start(async (ctx) => {
         username,
         firstName: ctx.from.first_name,
         lastName: ctx.from.last_name,
-        balance: 1000 // Starting bonus
+        balance: 1000
       });
       
       await ctx.reply(
         `🎉 ကြိုဆိုပါတယ် ${username}!\n\n` +
         `သင့်အကောင့်ကို စတင်ဖွင့်လှစ်လိုက်ပါပြီ။\n` +
         `လက်ကျန်ငွေ: 1000 MMK\n\n` +
-        `ဂိမ်းစတင်ဆော့ကစားရန် Mini App ကိုဖွင့်ပါ။`
+        `ဂိမ်းစတင်ဆော့ကစားရန် အောက်ပါကိုနှိပ်ပါ။`
       );
     } else {
       await ctx.reply(
@@ -424,11 +468,10 @@ bot.start(async (ctx) => {
       );
     }
     
-    // Send Mini App button
-    await ctx.reply('ဂိမ်းစတင်ရန် အောက်ပါကိုနှိပ်ပါ', {
+    await ctx.reply('🎮 ဂိမ်းစတင်ရန်', {
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🎮 CRASH GAME ဖွင့်ရန်', web_app: { url: 'https://crash-gamemoney.vercel.app/' } }]
+          [{ text: '🎲 CRASH GAME ဖွင့်ရန်', web_app: { url: 'https://crash-gamemoney.vercel.app/' } }]
         ]
       }
     });
@@ -438,16 +481,20 @@ bot.start(async (ctx) => {
   }
 });
 
-// Deposit request handler
+// Handle WebApp data
 bot.on('message', async (ctx) => {
   if (ctx.message.web_app_data) {
-    // Handle Mini App data
-    const data = JSON.parse(ctx.message.web_app_data.data);
-    
-    if (data.type === 'deposit') {
-      await handleDeposit(ctx, data);
-    } else if (data.type === 'withdraw') {
-      await handleWithdraw(ctx, data);
+    try {
+      const data = JSON.parse(ctx.message.web_app_data.data);
+      console.log('📱 WebApp data received:', data);
+      
+      if (data.type === 'deposit') {
+        await handleDeposit(ctx, data);
+      } else if (data.type === 'withdraw') {
+        await handleWithdraw(ctx, data);
+      }
+    } catch (error) {
+      console.error('Error handling web_app_data:', error);
     }
   }
 });
@@ -456,90 +503,115 @@ async function handleDeposit(ctx, data) {
   const telegramId = ctx.from.id.toString();
   const username = ctx.from.username || `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
   
-  // Save deposit request
-  const transaction = await Transaction.create({
-    userId: telegramId,
-    username,
-    type: 'deposit',
-    amount: data.amount,
-    screenshotUrl: data.screenshotUrl,
-    paymentMethod: data.paymentMethod,
-    status: 'pending'
-  });
+  console.log('Processing deposit for:', { telegramId, username, data });
   
-  // Send to admin group for approval
-  await ctx.telegram.sendMessage(
-    ADMIN_GROUP_ID,
-    `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
-    `👤 User: ${username}\n` +
-    `🆔 ID: ${telegramId}\n` +
-    `💵 ပမာဏ: ${data.amount} MMK\n` +
-    `💳 ငွေသွင်းနည်း: ${data.paymentMethod}\n` +
-    `📸 [ပြေစာကြည့်ရန်](${data.screenshotUrl})\n` +
-    `🆔 Transaction ID: ${transaction._id}`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
-            { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
-          ]
-        ]
-      }
+  try {
+    const transaction = await Transaction.create({
+      userId: telegramId,
+      username,
+      type: 'deposit',
+      amount: data.amount,
+      screenshotUrl: data.screenshotUrl || 'manual',
+      paymentMethod: data.paymentMethod || 'KPay',
+      status: 'pending'
+    });
+    
+    console.log('Transaction created:', transaction._id);
+    
+    if (ADMIN_GROUP_ID) {
+      await ctx.telegram.sendMessage(
+        ADMIN_GROUP_ID,
+        `💰 *ငွေသွင်းရန် တောင်းဆိုချက်*\n\n` +
+        `👤 User: ${username}\n` +
+        `🆔 ID: ${telegramId}\n` +
+        `💵 ပမာဏ: ${data.amount} MMK\n` +
+        `💳 ငွေသွင်းနည်း: ${data.paymentMethod}\n` +
+        `🆔 Transaction ID: ${transaction._id}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ အတည်ပြုမည်', callback_data: `confirm_deposit_${transaction._id}` },
+                { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_deposit_${transaction._id}` }
+              ]
+            ]
+          }
+        }
+      );
+      console.log('Admin notification sent');
+    } else {
+      console.log('ADMIN_GROUP_ID not set');
     }
-  );
-  
-  await ctx.reply('ငွေသွင်းရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin အတည်ပြုပြီးပါက ငွေလက်ကျန်ထဲသို့ ထည့်ပေးပါမည်။');
+    
+    await ctx.reply('✅ ငွေသွင်းရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin အတည်ပြုပြီးပါက ငွေလက်ကျန်ထဲသို့ ထည့်ပေးပါမည်။');
+  } catch (error) {
+    console.error('Error in handleDeposit:', error);
+    await ctx.reply('စနစ်ကျသင့်မှုတစ်ခုဖြစ်ပွားခဲ့ပါသည်။');
+  }
 }
 
 async function handleWithdraw(ctx, data) {
   const telegramId = ctx.from.id.toString();
   const username = ctx.from.username || `${ctx.from.first_name} ${ctx.from.last_name || ''}`.trim();
   
-  // Check balance
-  const user = await User.findOne({ telegramId });
-  if (!user || user.balance < data.amount) {
-    await ctx.reply('လက်ကျန်ငွေ မလုံလောက်ပါ။');
-    return;
-  }
+  console.log('Processing withdraw for:', { telegramId, username, data });
   
-  // Save withdraw request
-  const transaction = await Transaction.create({
-    userId: telegramId,
-    username,
-    type: 'withdraw',
-    amount: data.amount,
-    accountName: data.accountName,
-    accountNumber: data.accountNumber,
-    status: 'pending'
-  });
-  
-  // Send to admin group
-  await ctx.telegram.sendMessage(
-    ADMIN_GROUP_ID,
-    `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
-    `👤 User: ${username}\n` +
-    `🆔 ID: ${telegramId}\n` +
-    `💵 ပမာဏ: ${data.amount} MMK\n` +
-    `🏦 KPay နံပါတ်: ${data.accountNumber}\n` +
-    `📝 နာမည်: ${data.accountName}\n` +
-    `🆔 Transaction ID: ${transaction._id}\n` +
-    `💰 လက်ကျန်: ${user.balance} MMK`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
-            { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
-          ]
-        ]
-      }
+  try {
+    const user = await User.findOne({ telegramId });
+    if (!user) {
+      await ctx.reply('အကောင့်မရှိပါ။');
+      return;
     }
-  );
-  
-  await ctx.reply('ငွေထုတ်ရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin ငွေလွှဲပြီးပါက အတည်ပြုပေးပါမည်။');
+    
+    if (user.balance < data.amount) {
+      await ctx.reply('လက်ကျန်ငွေ မလုံလောက်ပါ။');
+      return;
+    }
+    
+    const transaction = await Transaction.create({
+      userId: telegramId,
+      username,
+      type: 'withdraw',
+      amount: data.amount,
+      accountName: data.accountName,
+      accountNumber: data.accountNumber,
+      status: 'pending'
+    });
+    
+    console.log('Transaction created:', transaction._id);
+    
+    if (ADMIN_GROUP_ID) {
+      await ctx.telegram.sendMessage(
+        ADMIN_GROUP_ID,
+        `💸 *ငွေထုတ်ရန် တောင်းဆိုချက်*\n\n` +
+        `👤 User: ${username}\n` +
+        `🆔 ID: ${telegramId}\n` +
+        `💵 ပမာဏ: ${data.amount} MMK\n` +
+        `🏦 KPay နံပါတ်: ${data.accountNumber}\n` +
+        `📝 နာမည်: ${data.accountName}\n` +
+        `🆔 Transaction ID: ${transaction._id}\n` +
+        `💰 လက်ကျန်: ${user.balance} MMK`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ ငွေလွှဲပြီးပါပြီ', callback_data: `confirm_withdraw_${transaction._id}` },
+                { text: '❌ ငြင်းပယ်မည်', callback_data: `reject_withdraw_${transaction._id}` }
+              ]
+            ]
+          }
+        }
+      );
+      console.log('Admin notification sent');
+    }
+    
+    await ctx.reply('✅ ငွေထုတ်ရန် တောင်းဆိုချက်ကို လက်ခံရရှိပါသည်။ Admin ငွေလွှဲပြီးပါက အတည်ပြုပေးပါမည်။');
+  } catch (error) {
+    console.error('Error in handleWithdraw:', error);
+    await ctx.reply('စနစ်ကျသင့်မှုတစ်ခုဖြစ်ပွားခဲ့ပါသည်။');
+  }
 }
 
 // Admin callback handlers
@@ -547,117 +619,79 @@ bot.action(/confirm_deposit_(.+)/, async (ctx) => {
   const transactionId = ctx.match[1];
   const adminUsername = ctx.from.username || ctx.from.first_name;
   
-  const transaction = await Transaction.findById(transactionId);
-  if (!transaction) {
-    await ctx.answerCbQuery('Transaction not found');
-    return;
+  try {
+    const transaction = await Transaction.findById(transactionId);
+    if (!transaction) {
+      await ctx.answerCbQuery('Transaction not found');
+      return;
+    }
+    
+    const user = await User.findOne({ telegramId: transaction.userId });
+    if (user) {
+      user.balance += transaction.amount;
+      user.totalDeposited += transaction.amount;
+      await user.save();
+      
+      transaction.status = 'confirmed';
+      transaction.confirmedBy = adminUsername;
+      transaction.confirmedAt = new Date();
+      await transaction.save();
+      
+      await ctx.telegram.sendMessage(
+        transaction.userId,
+        `✅ ငွေသွင်းတောင်းဆိုချက် အတည်ပြုပြီးပါပြီ။\n` +
+        `💰 ပမာဏ: ${transaction.amount} MMK\n` +
+        `💳 လက်ကျန်အသစ်: ${user.balance} MMK`
+      );
+      
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+      await ctx.answerCbQuery('✅ Deposit confirmed');
+      
+      io.emit('balanceUpdate', { userId: transaction.userId, balance: user.balance });
+    }
+  } catch (error) {
+    console.error('Error in confirm_deposit:', error);
+    await ctx.answerCbQuery('Error processing request');
   }
-  
-  // Update user balance
-  const user = await User.findOne({ telegramId: transaction.userId });
-  if (user) {
-    user.balance += transaction.amount;
-    user.totalDeposited += transaction.amount;
-    await user.save();
-  }
-  
-  transaction.status = 'confirmed';
-  transaction.confirmedBy = adminUsername;
-  transaction.confirmedAt = new Date();
-  await transaction.save();
-  
-  // Notify user
-  await ctx.telegram.sendMessage(
-    transaction.userId,
-    `✅ ငွေသွင်းတောင်းဆိုချက် အတည်ပြုပြီးပါပြီ။\n` +
-    `💰 ပမာဏ: ${transaction.amount} MMK\n` +
-    `💳 လက်ကျန်အသစ်: ${user.balance} MMK\n\n` +
-    `ကျေးဇူးတင်ပါတယ်။`
-  );
-  
-  await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-  await ctx.answerCbQuery('✅ Deposit confirmed');
-});
-
-bot.action(/reject_deposit_(.+)/, async (ctx) => {
-  const transactionId = ctx.match[1];
-  
-  const transaction = await Transaction.findById(transactionId);
-  if (!transaction) {
-    await ctx.answerCbQuery('Transaction not found');
-    return;
-  }
-  
-  transaction.status = 'rejected';
-  await transaction.save();
-  
-  // Ask for rejection reason
-  await ctx.reply('ငြင်းပယ်ရသည့် အကြောင်းအရင်းကို ရေးပေးပါ:', {
-    reply_markup: { force_reply: true }
-  });
-  
-  // Store transaction ID in session for next message
-  ctx.session = { transactionId };
 });
 
 bot.action(/confirm_withdraw_(.+)/, async (ctx) => {
   const transactionId = ctx.match[1];
   const adminUsername = ctx.from.username || ctx.from.first_name;
   
-  const transaction = await Transaction.findById(transactionId);
-  if (!transaction) {
-    await ctx.answerCbQuery('Transaction not found');
-    return;
-  }
-  
-  const user = await User.findOne({ telegramId: transaction.userId });
-  if (user) {
-    user.balance -= transaction.amount;
-    user.totalWithdrawn += transaction.amount;
-    await user.save();
-  }
-  
-  transaction.status = 'confirmed';
-  transaction.confirmedBy = adminUsername;
-  transaction.confirmedAt = new Date();
-  await transaction.save();
-  
-  // Notify user
-  await ctx.telegram.sendMessage(
-    transaction.userId,
-    `✅ ငွေထုတ်တောင်းဆိုချက် အတည်ပြုပြီးပါပြီ။\n` +
-    `💰 ပမာဏ: ${transaction.amount} MMK ကို သင့် KPay သို့ လွှဲပေးလိုက်ပါပြီ။\n` +
-    `💳 လက်ကျန်အသစ်: ${user.balance} MMK\n\n` +
-    `ကျေးဇူးတင်ပါတယ်။`
-  );
-  
-  await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-  await ctx.answerCbQuery('✅ Withdraw confirmed');
-});
-
-// Handle reply messages (rejection reasons)
-bot.on('text', async (ctx) => {
-  if (ctx.message.reply_to_message && ctx.session?.transactionId) {
-    const transactionId = ctx.session.transactionId;
-    const reason = ctx.message.text;
-    
+  try {
     const transaction = await Transaction.findById(transactionId);
-    if (transaction) {
-      transaction.adminNote = reason;
-      await transaction.save();
-      
-      // Notify user
-      await ctx.telegram.sendMessage(
-        transaction.userId,
-        `❌ ငွေသွင်းတောင်းဆိုချက် ငြင်းပယ်ခံရပါသည်။\n` +
-        `အကြောင်းအရင်း: ${reason}\n\n` +
-        `ထပ်မံကြိုးစားကြည့်ပါ။`
-      );
-      
-      await ctx.reply('အကြောင်းအရင်းကို User ထံ ပို့လိုက်ပါပြီ။');
+    if (!transaction) {
+      await ctx.answerCbQuery('Transaction not found');
+      return;
     }
     
-    delete ctx.session.transactionId;
+    const user = await User.findOne({ telegramId: transaction.userId });
+    if (user) {
+      user.balance -= transaction.amount;
+      user.totalWithdrawn += transaction.amount;
+      await user.save();
+      
+      transaction.status = 'confirmed';
+      transaction.confirmedBy = adminUsername;
+      transaction.confirmedAt = new Date();
+      await transaction.save();
+      
+      await ctx.telegram.sendMessage(
+        transaction.userId,
+        `✅ ငွေထုတ်တောင်းဆိုချက် အတည်ပြုပြီးပါပြီ။\n` +
+        `💰 ပမာဏ: ${transaction.amount} MMK ကို သင့် KPay သို့ လွှဲပေးလိုက်ပါပြီ။\n` +
+        `💳 လက်ကျန်အသစ်: ${user.balance} MMK`
+      );
+      
+      await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
+      await ctx.answerCbQuery('✅ Withdraw confirmed');
+      
+      io.emit('balanceUpdate', { userId: transaction.userId, balance: user.balance });
+    }
+  } catch (error) {
+    console.error('Error in confirm_withdraw:', error);
+    await ctx.answerCbQuery('Error processing request');
   }
 });
 
@@ -672,8 +706,8 @@ app.post('/api/auth', async (req, res) => {
       user = await User.create({
         telegramId: id.toString(),
         username: username || `${first_name} ${last_name || ''}`.trim(),
-        firstName: first_name,
-        lastName: last_name,
+        firstName: first_name || '',
+        lastName: last_name || '',
         balance: 1000
       });
     } else {
@@ -697,75 +731,45 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
-app.get('/api/balance/:userId', async (req, res) => {
-  try {
-    const user = await User.findOne({ telegramId: req.params.userId });
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    
-    res.json({
-      success: true,
-      balance: user.balance
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
-app.get('/api/history/:userId', async (req, res) => {
-  try {
-    const bets = await Bet.find({ userId: req.params.userId })
-      .sort({ createdAt: -1 })
-      .limit(20);
-    
-    res.json({
-      success: true,
-      history: bets
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error' });
-  }
-});
-
 // Socket.io connection handler
 io.on('connection', (socket) => {
   console.log('🟢 Client connected:', socket.id);
   
-  // Send current game state
+  const userId = socket.handshake.query.userId;
+  if (userId) {
+    socket.userId = userId;
+    console.log('User ID from query:', userId);
+  }
+  
   socket.emit('multiplier', {
     multiplier: gameState.currentMultiplier,
     gameState: gameState.isRunning ? 'running' : 'waiting'
   });
   
-  // Handle bet placement
+  const activeBets = Array.from(gameState.bets.values())
+    .filter(b => !b.cashedAt)
+    .map(b => ({
+      username: b.username,
+      amount: b.amount,
+      isBot: b.isBot || false
+    }));
+  socket.emit('activeBets', { bets: activeBets });
+  
   socket.on('placeBet', async (data, callback) => {
+    console.log('placeBet received:', data);
     const result = await placeBet(data.userId, data.username, data.amount);
     callback(result);
-    
-    if (result.success) {
-      io.emit('newBet', {
-        userId: data.userId,
-        username: data.username,
-        amount: data.amount
-      });
-    }
   });
   
-  // Handle cash out
   socket.on('cashOut', async (data, callback) => {
-    // Get userId from socket handshake or data
-    const userId = socket.userId || data.userId;
-    const result = await cashOut(userId, data.multiplier);
+    console.log('cashOut received:', data);
+    const result = await cashOut(data.userId, data.multiplier);
     callback(result);
-    
-    if (result.success) {
-      io.emit('cashout', {
-        userId: userId,
-        multiplier: data.multiplier,
-        profit: result.profit
-      });
-    }
+  });
+  
+  socket.on('authenticate', (data) => {
+    socket.userId = data.userId;
+    console.log('Socket authenticated:', data.userId);
   });
   
   socket.on('disconnect', () => {
@@ -794,7 +798,7 @@ bot.launch().then(() => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
 
@@ -802,8 +806,10 @@ server.listen(PORT, () => {
 process.once('SIGINT', () => {
   bot.stop('SIGINT');
   mongoose.disconnect();
+  process.exit(0);
 });
 process.once('SIGTERM', () => {
   bot.stop('SIGTERM');
   mongoose.disconnect();
+  process.exit(0);
 });
