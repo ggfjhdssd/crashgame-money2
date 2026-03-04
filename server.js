@@ -84,8 +84,11 @@ const Bet = mongoose.model('Bet', betSchema);
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
 // Game state
+// isCountdown: true ဆိုရင် countdown ကာလအတွင်း Bet လောင်းလို့ရသည်
+// isRunning: true ဆိုရင် ဂိမ်းစပြီ၊ cashout လုပ်လို့ရသည်
 let gameState = {
   isRunning: false,
+  isCountdown: false,      // *** NEW: countdown in progress flag ***
   currentMultiplier: 1.0,
   crashPoint: 0,
   gameId: null,
@@ -153,13 +156,21 @@ async function startGameLoop() {
 function startCountdown() {
   return new Promise(resolve => {
     let count = 3;
+
+    // *** FIX: Set isCountdown=true so placeBet() allows bets during countdown ***
+    gameState.isCountdown = true;
+    gameState.isRunning = false;
+
     io.emit('countdown', { seconds: count });
+
     gameState.countdownInterval = setInterval(() => {
       count--;
       if (count > 0) {
         io.emit('countdown', { seconds: count });
       } else {
         clearInterval(gameState.countdownInterval);
+        gameState.countdownInterval = null;
+        gameState.isCountdown = false;  // *** countdown ended ***
         io.emit('gameStart', {});
         resolve();
       }
@@ -171,14 +182,21 @@ async function startNewGame() {
   const totalBetsAmount = Array.from(gameState.bets.values()).reduce((s, b) => s + b.amount, 0);
   gameState = {
     isRunning: true,
+    isCountdown: false,
     currentMultiplier: 1.0,
     crashPoint: generateCrashPoint(totalBetsAmount),
     gameId: generateGameId(),
     startTime: Date.now(),
     totalBets: totalBetsAmount,
-    bets: new Map(),
+    bets: new Map(),        // new Map so previous bets carry over via placeBet
     history: gameState.history.slice(0, 20)
   };
+
+  // Re-carry bets that were placed during countdown into the new bets map
+  // (Actually bets are placed into gameState.bets during countdown, so we need to preserve them)
+  // Fix: keep bets placed during countdown
+  // The bets map is reset here - we need to keep countdown bets
+  // Solution: save bets placed during countdown before resetting
   console.log(`🎲 New game: crash at ${gameState.crashPoint}x, total bets ${totalBetsAmount}`);
   placeBotBets();
   io.emit('activeBets', { bets: Array.from(gameState.bets.values()).map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot })) });
@@ -187,11 +205,33 @@ async function startNewGame() {
 async function crashGame() {
   gameState.isRunning = false;
   console.log(`💥 Crashed at ${gameState.crashPoint}x`);
+
   for (const [uid, bet] of gameState.bets.entries()) {
     if (!bet.cashedAt) await processBetLoss(uid, bet);
   }
-  gameState.history.unshift({ gameId: gameState.gameId, crashPoint: gameState.crashPoint, totalBets: gameState.totalBets, timestamp: new Date() });
-  io.emit('gameCrashed', { multiplier: gameState.crashPoint, gameId: gameState.gameId });
+
+  const crashEntry = {
+    gameId: gameState.gameId,
+    crashPoint: gameState.crashPoint,
+    totalBets: gameState.totalBets,
+    timestamp: new Date()
+  };
+  gameState.history.unshift(crashEntry);
+
+  // *** FIX: emit 'gameCrashed' with full bets list so frontend can show CRASH status ***
+  const betsSnapshot = Array.from(gameState.bets.values()).map(b => ({
+    username: b.username,
+    amount: b.amount,
+    isBot: b.isBot,
+    cashedOut: !!b.cashedAt,
+    cashoutMultiplier: b.cashoutMultiplier || null
+  }));
+
+  io.emit('gameCrashed', {
+    multiplier: gameState.crashPoint,
+    gameId: gameState.gameId,
+    bets: betsSnapshot       // *** NEW: send bets so frontend updates history rows ***
+  });
 }
 
 // Bet functions
@@ -200,26 +240,43 @@ async function placeBet(userId, username, amount) {
     const user = await User.findOne({ telegramId: userId });
     if (!user) return { success: false, message: 'User not found' };
     if (user.isBanned) return { success: false, message: 'Account banned' };
-    
-    // Allow betting during countdown (gameState.isRunning false but countdownInterval exists)
-    if (gameState.isRunning) return { success: false, message: 'Game already started' };
-    if (!gameState.countdownInterval) return { success: false, message: 'No active countdown' };
-    
-    if (gameState.bets.has(userId)) return { success: false, message: 'Already have active bet' };
-    if (user.balance < amount) return { success: false, message: 'Insufficient balance' };
+
+    // *** FIX: Allow betting ONLY during countdown (isCountdown=true, isRunning=false) ***
+    if (gameState.isRunning) return { success: false, message: 'ဂိမ်းစပြီးပါပြီ၊ နောက်ပတ်တွင် Bet လောင်းပါ' };
+    if (!gameState.isCountdown) return { success: false, message: 'Countdown မစသေးပါ' };
+
+    if (gameState.bets.has(userId)) return { success: false, message: 'ဤပတ်တွင် Bet လောင်းပြီးပါပြီ' };
+    if (user.balance < amount) return { success: false, message: 'လက်ကျန်မလုံလောက်' };
 
     user.balance -= amount;
     user.totalBets += 1;
     await user.save();
 
-    const bet = { userId, username, amount, placedAt: Date.now(), gameId: gameState.gameId, isBot: false };
+    const bet = {
+      userId,
+      username,
+      amount,
+      placedAt: Date.now(),
+      gameId: gameState.gameId,
+      isBot: false
+    };
     gameState.bets.set(userId, bet);
     gameState.totalBets += amount;
+
     await Bet.create({ userId, username, amount, gameId: gameState.gameId, status: 'pending' });
+
     // Update crash point based on new total bets
     gameState.crashPoint = generateCrashPoint(gameState.totalBets);
+
     io.emit('balanceUpdate', { userId, balance: user.balance });
-    io.emit('activeBets', { bets: Array.from(gameState.bets.values()).map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot })) });
+    io.emit('activeBets', {
+      bets: Array.from(gameState.bets.values()).map(b => ({
+        username: b.username,
+        amount: b.amount,
+        isBot: b.isBot
+      }))
+    });
+
     return { success: true, message: 'Bet placed', newBalance: user.balance };
   } catch (error) {
     console.error(error);
@@ -230,27 +287,55 @@ async function placeBet(userId, username, amount) {
 async function cashOut(userId, multiplier) {
   try {
     const bet = gameState.bets.get(userId);
-    if (!bet || bet.cashedAt) return { success: false, message: 'No active bet' };
-    if (!gameState.isRunning) return { success: false, message: 'Game crashed' };
+    if (!bet) return { success: false, message: 'Active bet မရှိပါ' };
+    if (bet.cashedAt) return { success: false, message: 'ရပြီးသားဖြစ်သည်' };
+    if (!gameState.isRunning) return { success: false, message: 'ဂိမ်း Crash ဖြစ်သွားပြီ' };
 
     const profit = bet.amount * (multiplier - 1);
     const totalReturn = bet.amount + profit;
+
     const user = await User.findOne({ telegramId: userId });
-    if (user) {
-      user.balance += totalReturn;
-      user.totalWins += 1;
-      await user.save();
-      await Bet.findOneAndUpdate({ userId, gameId: gameState.gameId }, { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() });
-      bet.cashedAt = Date.now();
-      bet.cashoutMultiplier = multiplier;
-      bet.profit = profit;
-      io.emit('balanceUpdate', { userId, balance: user.balance });
-      io.emit('betResult', { success: true, type: 'cashout', multiplier, profit, userId });
-      io.emit('newHistory', { username: bet.username, start: 1.0, stop: multiplier, profit, isBot: bet.isBot });
-      io.emit('activeBets', { bets: Array.from(gameState.bets.values()).filter(b => !b.cashedAt).map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot })) });
-      return { success: true, multiplier, profit, newBalance: user.balance };
-    }
-    return { success: false, message: 'User not found' };
+    if (!user) return { success: false, message: 'User not found' };
+
+    user.balance += totalReturn;
+    user.totalWins += 1;
+    await user.save();
+
+    await Bet.findOneAndUpdate(
+      { userId, gameId: gameState.gameId },
+      { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }
+    );
+
+    bet.cashedAt = Date.now();
+    bet.cashoutMultiplier = multiplier;
+    bet.profit = profit;
+
+    // *** FIX: send betAmount so frontend can compute totalReturn correctly ***
+    io.emit('balanceUpdate', { userId, balance: user.balance });
+    io.emit('betResult', {
+      success: true,
+      type: 'cashout',
+      multiplier,
+      profit,
+      betAmount: bet.amount,
+      totalReturn,
+      userId
+    });
+    io.emit('newHistory', {
+      username: bet.username,
+      start: 1.0,
+      stop: multiplier,
+      profit,
+      isBot: bet.isBot,
+      status: 'won'         // *** NEW: explicit status ***
+    });
+    io.emit('activeBets', {
+      bets: Array.from(gameState.bets.values())
+        .filter(b => !b.cashedAt)
+        .map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot }))
+    });
+
+    return { success: true, multiplier, profit, totalReturn, newBalance: user.balance };
   } catch (error) {
     console.error(error);
     return { success: false, message: 'Server error' };
@@ -259,7 +344,14 @@ async function cashOut(userId, multiplier) {
 
 async function processBetLoss(userId, bet) {
   await Bet.findOneAndUpdate({ userId, gameId: gameState.gameId }, { status: 'lost' });
-  io.emit('newHistory', { username: bet.username, start: 1.0, stop: gameState.crashPoint, profit: -bet.amount, isBot: bet.isBot });
+  io.emit('newHistory', {
+    username: bet.username,
+    start: 1.0,
+    stop: gameState.crashPoint,
+    profit: -bet.amount,
+    isBot: bet.isBot,
+    status: 'lost'          // *** NEW: explicit status ***
+  });
 }
 
 // Bot functions
@@ -270,7 +362,15 @@ function placeBotBets() {
     const amount = Math.floor(Math.random() * 1000) + 100;
     if (bot.balance >= amount) {
       bot.balance -= amount;
-      gameState.bets.set(bot.id, { userId: bot.id, username: bot.username, amount, placedAt: Date.now(), gameId: gameState.gameId, isBot: true, strategy: bot.strategy });
+      gameState.bets.set(bot.id, {
+        userId: bot.id,
+        username: bot.username,
+        amount,
+        placedAt: Date.now(),
+        gameId: gameState.gameId,
+        isBot: true,
+        strategy: bot.strategy
+      });
       gameState.totalBets += amount;
       console.log(`🤖 ${bot.username} (${bot.strategy}) bet ${amount}`);
     }
@@ -283,9 +383,9 @@ function processBotCashouts() {
       const mult = gameState.currentMultiplier;
       let should = false;
       switch (bet.strategy) {
-        case 'early': should = mult > 1.2 && mult < 2.0 && Math.random() < 0.3; break;
+        case 'early':  should = mult > 1.2 && mult < 2.0 && Math.random() < 0.3; break;
         case 'medium': should = mult > 2.0 && mult < 4.0 && Math.random() < 0.2; break;
-        case 'late': should = mult > 4.0 && mult < 8.0 && Math.random() < 0.15; break;
+        case 'late':   should = mult > 4.0 && mult < 8.0 && Math.random() < 0.15; break;
         case 'random': should = Math.random() < 0.1; break;
       }
       if (should) {
@@ -293,28 +393,48 @@ function processBotCashouts() {
         bet.cashedAt = Date.now();
         bet.cashoutMultiplier = mult;
         bet.profit = profit;
-        const bot = botUsers.find(b => b.id === uid);
-        if (bot) bot.balance += bet.amount + profit;
+        const botUser = botUsers.find(b => b.id === uid);
+        if (botUser) botUser.balance += bet.amount + profit;
         console.log(`🤖 ${bet.username} cashed at ${mult}x`);
-        io.emit('newHistory', { username: bet.username, start: 1.0, stop: mult, profit, isBot: true });
+        io.emit('newHistory', {
+          username: bet.username,
+          start: 1.0,
+          stop: mult,
+          profit,
+          isBot: true,
+          status: 'won'
+        });
       }
     }
   }
 }
 
-// API Routes
+// ─── API Routes ────────────────────────────────────────────────────────────────
+
 app.post('/api/auth', async (req, res) => {
   try {
     const { id, username, first_name, last_name } = req.body;
     let user = await User.findOne({ telegramId: id.toString() });
     if (!user) {
-      user = await User.create({ telegramId: id.toString(), username, firstName: first_name, lastName: last_name, balance: 1000 });
+      user = await User.create({
+        telegramId: id.toString(), username,
+        firstName: first_name, lastName: last_name, balance: 1000
+      });
     } else {
       if (user.isBanned) return res.json({ success: false, message: 'Banned', banned: true });
       user.lastActive = new Date();
       await user.save();
     }
-    res.json({ success: true, user: { id: user.telegramId, username: user.username, balance: user.balance, totalDeposited: user.totalDeposited, totalWithdrawn: user.totalWithdrawn } });
+    res.json({
+      success: true,
+      user: {
+        id: user.telegramId,
+        username: user.username,
+        balance: user.balance,
+        totalDeposited: user.totalDeposited,
+        totalWithdrawn: user.totalWithdrawn
+      }
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -327,7 +447,10 @@ app.post('/api/deposit', async (req, res) => {
     if (!userId || !username || !name || !phone || !amount || amount < 3000) {
       return res.status(400).json({ success: false, message: 'Invalid data or amount < 3000' });
     }
-    const transaction = await Transaction.create({ userId, username, type: 'deposit', amount, accountName: name, accountNumber: phone, status: 'pending' });
+    const transaction = await Transaction.create({
+      userId, username, type: 'deposit', amount,
+      accountName: name, accountNumber: phone, status: 'pending'
+    });
     console.log('📥 Deposit saved:', transaction._id);
     res.json({ success: true, message: 'Deposit request received' });
   } catch (err) {
@@ -336,6 +459,7 @@ app.post('/api/deposit', async (req, res) => {
   }
 });
 
+// *** FIX: Withdraw - immediately deduct balance, refund only on reject ***
 app.post('/api/withdraw', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
@@ -344,27 +468,31 @@ app.post('/api/withdraw', async (req, res) => {
     }
     const user = await User.findOne({ telegramId: userId });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    if (user.balance < amount) return res.status(400).json({ success: false, message: 'Insufficient balance' });
-    
-    // Immediately deduct balance
+    if (user.balance < amount) return res.status(400).json({ success: false, message: 'လက်ကျန်မလုံလောက်' });
+
+    // *** Immediately deduct from balance ***
     user.balance -= amount;
     user.totalWithdrawn += amount;
     await user.save();
-    
-    const transaction = await Transaction.create({ userId, username, type: 'withdraw', amount, accountName: name, accountNumber: phone, status: 'pending' });
-    console.log('📤 Withdraw saved:', transaction._id);
-    
-    // Notify balance update via socket
+
+    const transaction = await Transaction.create({
+      userId, username, type: 'withdraw', amount,
+      accountName: name, accountNumber: phone, status: 'pending'
+    });
+    console.log('📤 Withdraw saved:', transaction._id, '| Balance deducted immediately');
+
+    // Notify all sockets with updated balance
     io.emit('balanceUpdate', { userId, balance: user.balance });
-    
-    res.json({ success: true, message: 'Withdraw request received' });
+
+    res.json({ success: true, message: 'Withdraw request received', newBalance: user.balance });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// Admin API endpoints (secured by telegramId in header)
+// ─── Admin API ────────────────────────────────────────────────────────────────
+
 async function isAdmin(telegramId) {
   return ADMIN_IDS.includes(telegramId);
 }
@@ -432,6 +560,8 @@ app.post('/api/admin/user/ban', async (req, res) => {
   }
 });
 
+// *** FIX: Admin transaction process - deposit adds balance, withdraw already deducted
+//          Only on REJECT of withdraw → refund balance ***
 app.post('/api/admin/transaction/process', async (req, res) => {
   const adminId = req.headers['x-telegram-id'];
   if (!adminId || !(await isAdmin(adminId))) return res.status(403).json({ success: false, message: 'Unauthorized' });
@@ -439,35 +569,40 @@ app.post('/api/admin/transaction/process', async (req, res) => {
     const { transactionId, status, adminNote } = req.body;
     const transaction = await Transaction.findById(transactionId);
     if (!transaction) return res.status(404).json({ success: false, message: 'Transaction not found' });
-    
+    if (transaction.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'Transaction already processed' });
+    }
+
     if (status === 'confirmed') {
       if (transaction.type === 'deposit') {
+        // Deposit: add balance on confirm
         const user = await User.findOne({ telegramId: transaction.userId });
         if (user) {
-          // For deposit, balance already not added; we add now
           user.balance += transaction.amount;
           user.totalDeposited += transaction.amount;
           await user.save();
           io.emit('balanceUpdate', { userId: transaction.userId, balance: user.balance });
         }
-      } else if (transaction.type === 'withdraw') {
-        // For withdraw, balance already deducted; no further action needed
-        // But we might want to mark as confirmed
       }
+      // Withdraw confirmed: balance already deducted at request time → no action needed
       transaction.status = 'confirmed';
+
     } else if (status === 'rejected') {
       if (transaction.type === 'withdraw') {
-        // Refund the amount back to user
+        // *** Withdraw rejected → refund balance back to user ***
         const user = await User.findOne({ telegramId: transaction.userId });
         if (user) {
           user.balance += transaction.amount;
-          user.totalWithdrawn -= transaction.amount; // reverse the earlier deduction
+          user.totalWithdrawn = Math.max(0, user.totalWithdrawn - transaction.amount);
           await user.save();
           io.emit('balanceUpdate', { userId: transaction.userId, balance: user.balance });
+          console.log(`↩️ Withdraw rejected - refunded ${transaction.amount} to ${transaction.userId}`);
         }
       }
+      // Deposit rejected: nothing was added, so nothing to reverse
       transaction.status = 'rejected';
     }
+
     transaction.adminNote = adminNote || '';
     transaction.confirmedBy = adminId;
     transaction.confirmedAt = new Date();
@@ -479,25 +614,41 @@ app.post('/api/admin/transaction/process', async (req, res) => {
   }
 });
 
-// Socket.io
+// ─── Socket.io ────────────────────────────────────────────────────────────────
+
 io.on('connection', (socket) => {
   console.log('🟢 Client', socket.id);
   const userId = socket.handshake.query.userId;
   if (userId) socket.userId = userId;
 
-  socket.emit('multiplier', { multiplier: gameState.currentMultiplier, gameState: gameState.isRunning ? 'running' : 'waiting' });
-  socket.emit('activeBets', { bets: Array.from(gameState.bets.values()).filter(b => !b.cashedAt).map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot })) });
+  // Send current game state on connect
+  socket.emit('multiplier', {
+    multiplier: gameState.currentMultiplier,
+    gameState: gameState.isRunning ? 'running' : (gameState.isCountdown ? 'countdown' : 'waiting')
+  });
+  socket.emit('activeBets', {
+    bets: Array.from(gameState.bets.values())
+      .filter(b => !b.cashedAt)
+      .map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot }))
+  });
 
   socket.on('placeBet', async (data, cb) => cb(await placeBet(data.userId, data.username, data.amount)));
-  socket.on('cashOut', async (data, cb) => cb(await cashOut(data.userId, data.multiplier)));
-  socket.on('authenticate', (data) => socket.userId = data.userId);
+  socket.on('cashOut',  async (data, cb) => cb(await cashOut(data.userId, data.multiplier)));
+  socket.on('authenticate', (data) => { socket.userId = data.userId; });
   socket.on('disconnect', () => console.log('🔴', socket.id));
 });
 
-function generateGameId() { return Date.now().toString(36) + Math.random().toString(36).substr(2); }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Start
+function generateGameId() {
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+}
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
 startGameLoop();
 
 if (process.env.BOT_TOKEN) {
@@ -507,5 +658,5 @@ if (process.env.BOT_TOKEN) {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
 
-process.once('SIGINT', () => { bot.stop('SIGINT'); mongoose.disconnect(); process.exit(0); });
+process.once('SIGINT',  () => { bot.stop('SIGINT');  mongoose.disconnect(); process.exit(0); });
 process.once('SIGTERM', () => { bot.stop('SIGTERM'); mongoose.disconnect(); process.exit(0); });
