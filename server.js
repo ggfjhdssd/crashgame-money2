@@ -436,7 +436,6 @@ app.post('/api/admin/transaction/process', async (req, res) => {
       } else if (transaction.type === 'withdraw') {
         const user = await User.findOne({ telegramId: transaction.userId });
         if (user) {
-          // balance already deducted at request time? Actually we deduct on confirm.
           user.balance -= transaction.amount;
           user.totalWithdrawn += transaction.amount;
           await user.save();
@@ -446,9 +445,6 @@ app.post('/api/admin/transaction/process', async (req, res) => {
       transaction.status = 'confirmed';
     } else if (status === 'rejected') {
       transaction.status = 'rejected';
-      if (transaction.type === 'withdraw') {
-        // If withdraw was pending, no balance change yet.
-      }
     }
     transaction.adminNote = adminNote || '';
     transaction.confirmedBy = adminId;
