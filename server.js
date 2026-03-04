@@ -428,7 +428,7 @@ bot.start(async (ctx) => {
     await ctx.reply('ဂိမ်းစတင်ရန် အောက်ပါကိုနှိပ်ပါ', {
       reply_markup: {
         inline_keyboard: [
-          [{ text: '🎮 CRASH GAME ဖွင့်ရန်', web_app: { url: 'https://your-vercel-app.vercel.app' } }]
+          [{ text: '🎮 CRASH GAME ဖွင့်ရန်', web_app: { url: 'https://crash-gamemoney.vercel.app/' } }]
         ]
       }
     });
