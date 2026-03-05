@@ -1,37 +1,43 @@
 /**
- * ═══════════════════════════════════════════════════════════════
- *  CRASH PRO — server.js  (Production-grade rewrite)
- *  Fixes:
- *   1. Bets placed during countdown are PRESERVED when game starts
- *   2. gameId generated at countdown start (not game start)
- *   3. 50ms multiplier broadcast interval
- *   4. Strict cashOut: validates gameId + isRunning + no double-spend
- *   5. MongoDB connection-drop handling with retry
- *   6. Graceful socket disconnect cleanup
- *   7. Atomic-style balance ops via findOneAndUpdate to reduce race risk
- * ═══════════════════════════════════════════════════════════════
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  CRASH PRO — server.js  v3.0  (Profit-Control + Smart Bot System)
+ *
+ *  NEW FEATURES:
+ *   1. calculateCrashPoint() — House Edge Algorithm
+ *      • Max 15.00x hard cap
+ *      • 10% instant-loss games (1.01x ~ 1.02x)
+ *      • High-bet rigging: if userBets > 50,000 MMK → house keeps 70-80%
+ *      • Single high-roller protection: crash 1.10x~1.40x
+ *      • Admin Pressure mode: low house balance → more 1.1x crashes
+ *   2. Bot Pool (80+ Myanmar names) — static array, NO new objects per round
+ *      • Dynamic rotation: total players always exactly 6
+ *      • Shuffle seed changes every round for identity protection
+ *   3. Minimum Withdrawal: 5,000 MMK
+ *   4. Strict cashout latency check (phase guard)
+ *   5. 500+ concurrent user optimisation (Map ops, atomic DB)
+ * ═══════════════════════════════════════════════════════════════════════════
  */
 
 'use strict';
 
-const express    = require('express');
-const http       = require('http');
-const { Server } = require('socket.io');
-const mongoose   = require('mongoose');
-const cors       = require('cors');
-const dotenv     = require('dotenv');
+const express      = require('express');
+const http         = require('http');
+const { Server }   = require('socket.io');
+const mongoose     = require('mongoose');
+const cors         = require('cors');
+const dotenv       = require('dotenv');
 const { Telegraf } = require('telegraf');
 
 dotenv.config();
 
-// ─── Express + Socket.io setup ────────────────────────────────────────────────
+// ─── Express + Socket.io ───────────────────────────────────────────────────────
 
 const app    = express();
 const server = http.createServer(app);
 
 const ALLOWED_ORIGINS = [
   'https://crash-gamemoney.vercel.app',
-  'http://localhost:3000'
+  'http://localhost:3000',
 ];
 
 const io = new Server(server, {
@@ -47,41 +53,31 @@ app.use(express.urlencoded({ extended: true }));
 
 // ─── Telegram Bot ──────────────────────────────────────────────────────────────
 
-const bot      = new Telegraf(process.env.BOT_TOKEN || 'dummy');
+const bot       = new Telegraf(process.env.BOT_TOKEN || 'dummy');
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').filter(Boolean);
 
-// ─── MongoDB with reconnect handling ──────────────────────────────────────────
+// ─── MongoDB ───────────────────────────────────────────────────────────────────
 
 let dbReady = false;
 
 async function connectDB() {
   try {
     await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser:    true,
-      useUnifiedTopology: true,
+      useNewUrlParser: true, useUnifiedTopology: true,
       serverSelectionTimeoutMS: 5000,
     });
     dbReady = true;
     console.log('✅ MongoDB connected');
   } catch (err) {
-    console.error('❌ MongoDB connection failed, retrying in 5s…', err.message);
+    console.error('❌ MongoDB failed, retry 5s…', err.message);
     setTimeout(connectDB, 5000);
   }
 }
-
-mongoose.connection.on('disconnected', () => {
-  dbReady = false;
-  console.warn('⚠️  MongoDB disconnected, reconnecting…');
-  setTimeout(connectDB, 3000);
-});
-mongoose.connection.on('reconnected', () => {
-  dbReady = true;
-  console.log('✅ MongoDB reconnected');
-});
-
+mongoose.connection.on('disconnected', () => { dbReady = false; setTimeout(connectDB, 3000); });
+mongoose.connection.on('reconnected',  () => { dbReady = true; });
 connectDB();
 
-// ─── Schemas ──────────────────────────────────────────────────────────────────
+// ─── Schemas ───────────────────────────────────────────────────────────────────
 
 const userSchema = new mongoose.Schema({
   telegramId:     { type: String, required: true, unique: true, index: true },
@@ -130,95 +126,232 @@ const User        = mongoose.model('User',        userSchema);
 const Bet         = mongoose.model('Bet',         betSchema);
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
-// ─── Game constants ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  HOUSE EDGE CONFIG
+// ═══════════════════════════════════════════════════════════════════════════
 
-const COUNTDOWN_SECONDS  = 5;    // betting window
-const MULTIPLIER_TICK_MS = 50;   // emit interval (50ms = ~20fps)
-const BETWEEN_GAME_MS    = 3000; // pause after crash before next countdown
-const GROWTH_RATE        = 0.06; // multiplier growth per second (tune as needed)
+const HOUSE = {
+  MAX_MULTIPLIER:         15.00,   // Hard cap
+  INSTANT_LOSS_RATE:      0.10,    // 10% of games → 1.01x or 1.02x
+  HIGH_BET_THRESHOLD:     50000,   // MMK — trigger rigging above this
+  HOUSE_EDGE_RATIO:       0.75,    // House keeps 75% of pool when rigged
+  HIGH_ROLLER_THRESHOLD:  10000,   // Single bet above this → selective crash
+  HIGH_ROLLER_CRASH_MIN:  1.10,
+  HIGH_ROLLER_CRASH_MAX:  1.40,
+  PRESSURE_CRASH_MAX:     1.15,    // When admin balance low
+  PRESSURE_BALANCE_LIMIT: 5000,    // Admin virtual balance below this = pressure mode
+};
+
+// Admin's virtual "house balance" — tracks net profit (in-memory, resets on restart)
+// In production you'd persist this in DB; here we start at a comfortable figure
+let houseBalance = 500000; // MMK
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PROFIT-CONTROL CRASH POINT ALGORITHM
+//  calculateCrashPoint(totalUserBets, maxSingleBet)
+//
+//  Priority order:
+//   1. Instant-loss roll  (10%)
+//   2. Admin Pressure mode (low houseBalance)
+//   3. High-roller selective crash
+//   4. High total-pool rigging
+//   5. Normal random
+// ═══════════════════════════════════════════════════════════════════════════
+
+function calculateCrashPoint(totalUserBets = 0, maxSingleBet = 0) {
+  const rand = Math.random;
+
+  // ── 1. Instant loss (10% of all games) ───────────────────────────────────
+  if (rand() < HOUSE.INSTANT_LOSS_RATE) {
+    const cp = rand() < 0.5 ? 1.01 : 1.02;
+    console.log(`🎯 Instant-loss game: ${cp}x`);
+    return cp;
+  }
+
+  // ── 2. Admin Pressure mode ────────────────────────────────────────────────
+  //    If house balance is critically low, crash early more often
+  if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT && rand() < 0.60) {
+    const cp = round2(1.05 + rand() * (HOUSE.PRESSURE_CRASH_MAX - 1.05));
+    console.log(`⚠️  Pressure mode crash: ${cp}x (houseBalance=${houseBalance})`);
+    return cp;
+  }
+
+  // ── 3. High-roller selective crash ───────────────────────────────────────
+  //    A single user bet > threshold → crash before they profit much
+  if (maxSingleBet >= HOUSE.HIGH_ROLLER_THRESHOLD) {
+    // 70% chance to trigger selective crash
+    if (rand() < 0.70) {
+      const range = HOUSE.HIGH_ROLLER_CRASH_MAX - HOUSE.HIGH_ROLLER_CRASH_MIN;
+      const cp    = round2(HOUSE.HIGH_ROLLER_CRASH_MIN + rand() * range);
+      console.log(`🎯 High-roller protection crash: ${cp}x (single bet: ${maxSingleBet})`);
+      return cp;
+    }
+  }
+
+  // ── 4. Dynamic rigging — high total user bets ────────────────────────────
+  //    If pool > threshold, calculate crash so house keeps HOUSE_EDGE_RATIO of pool
+  if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
+    // House wants to pay out at most (1 - edge) * pool
+    // Max payout = pool * (1 - HOUSE_EDGE_RATIO)
+    // crashPoint = maxPayout / totalUserBets
+    // But we enforce a minimum crash of 1.05 so it's not too obvious
+    const maxPayout    = totalUserBets * (1 - HOUSE.HOUSE_EDGE_RATIO);
+    const targetMult   = maxPayout / totalUserBets;  // fraction < 1 usually
+    // We set crashPoint just below where users break even
+    // Jitter ±0.05 so it doesn't look deterministic
+    const jitter = (rand() - 0.5) * 0.10;
+    const cp     = round2(Math.max(1.05, Math.min(
+      HOUSE.MAX_MULTIPLIER,
+      targetMult + 1.0 + jitter   // +1.0 because mult starts at 1.0
+    )));
+    console.log(`💰 Rigged crash: ${cp}x (pool=${totalUserBets}, edge=${HOUSE.HOUSE_EDGE_RATIO})`);
+    return cp;
+  }
+
+  // ── 5. Normal random distribution ────────────────────────────────────────
+  let cp;
+  const roll = rand();
+  if      (roll < 0.35) cp = 1.10 + rand() * 0.90;   // 35%: 1.1x–2.0x
+  else if (roll < 0.60) cp = 2.00 + rand() * 2.00;   // 25%: 2.0x–4.0x
+  else if (roll < 0.80) cp = 4.00 + rand() * 4.00;   // 20%: 4.0x–8.0x
+  else if (roll < 0.93) cp = 8.00 + rand() * 4.00;   // 13%: 8.0x–12.0x
+  else                   cp = 12.0 + rand() * 3.00;   //  7%: 12.0x–15.0x
+
+  return round2(Math.min(cp, HOUSE.MAX_MULTIPLIER));
+}
+
+function round2(n) { return Math.round(n * 100) / 100; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BOT POOL  — 80 Myanmar bots, static array (NO new objects per round)
+//  Memory-safe: we store objects once at startup and rotate via index
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MYANMAR_BOT_NAMES = [
+  // Classic Myanmar names
+  "Seint Seint","Kyaw Kyaw","Aye Aye","Phyo Phyo","Su Su",
+  "Mg Mg","Zaw Zaw","Hla Hla","Mya Mya","Tun Tun",
+  "Thidar","Nilar","Zayar","Kaung Kaung","Htet Htet",
+  "Thet Thet","Myo Myo","Wutyi","Thae Thae","Chit Chit",
+  "Aung Aung","Bo Bo","Thiha","Min Min","Lin Lin",
+  // Trendy / Romanized
+  "Howmah_jsksn","Htuneaing","Zay_Yar_99","Ko_Latt_Pro","Mm_K_77",
+  "X_Aung_X","Lion_Heart_MM","Shadow_K","Dark_Moon_Htut","K_Phyo_88",
+  "Sweet_Yoon","Rose_Mi","Sky_Walker_Kyaw","Mg_Thura_007","Lucky_Win_Mg",
+  "J_Don_2024","Phoe_Wa_7","Black_Tiger_Ko","King_Aung_Gyi","Lady_Rose_9",
+  // Modern
+  "Zay Yar Htet","Yoon Wadi","Thoon Thadi","Eaindra","May Thu",
+  "Htet Arkar","Wai Yan","Sithu","Kaung Sett","Hein Htet",
+  "Pyae Phyo","Thant Sin","Yan Naing","Kyaw Zayar","Pyae Sone",
+  "Nay Chi","Hnin Oo","Ei Ei","Wai Wai","Khin Khin",
+  // Gaming style
+  "Pro_Gamer_Ko","King_MMK","Jackpot_Aung","Lucky_7_Mg","Win_Win_Ko",
+  "Tiger_Kyaw","Dragon_Phyo","Phoenix_Su","Wolf_Zaw","Eagle_Min",
+  "Ace_Htet","Boss_Aung","Chief_Bo","Maverick_Mg","Ninja_Ko",
+  "Sniper_Tun","Viper_Lin","Storm_Myo","Flash_Win","Ghost_Hla",
+  // Female names
+  "Honey_Thida","Angel_Nilar","Queen_Ei","Princess_Ma","Star_Aye",
+  "Moon_Hla","Flower_Mya","Cherry_Su","Jade_Khin","Pearl_Hnin",
+  "Crystal_Wai","Diamond_Nay","Ruby_Yoon","Sapphire_May","Gold_Thidar",
+  // Additional
+  "Maung Maung","Ko Latt","U Kyaw","Daw Khin","Ma Sandar",
+  "Ko Htun","Mg Thet","Su Myat","Ei Phyu","Nan Dar",
+];
+
+// ── Build the static bot pool once at startup ──────────────────────────────
+// Strategy distribution: early 30%, medium 35%, late 20%, random 15%
+const STRATEGIES = ['early','early','early','medium','medium','medium','medium','late','late','random'];
+
+/** @type {Map<string, BotObj>} */
+const BOT_POOL = new Map();
+
+MYANMAR_BOT_NAMES.forEach((name, i) => {
+  const id = `bot_${i}`;
+  BOT_POOL.set(id, {
+    id,
+    username:  name,
+    balance:   3000 + Math.floor(Math.random() * 12000),  // 3k–15k initial
+    strategy:  STRATEGIES[i % STRATEGIES.length],
+    lastRound: -1,   // round counter to avoid same bots two rounds in a row
+  });
+});
+
+// Convert to array for O(1) shuffle — do NOT recreate this array in the loop
+const BOT_ARRAY = Array.from(BOT_POOL.values());
+
+console.log(`🤖 Bot pool initialised: ${BOT_POOL.size} bots`);
+
+// ─── Shuffle utility (Fisher-Yates, in-place on a COPY) ───────────────────────
+function shuffleSlice(arr, count) {
+  // Returns `count` unique random elements without mutating original
+  const copy = arr.slice();
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, count);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GAME CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const COUNTDOWN_SECONDS  = 5;
+const MULTIPLIER_TICK_MS = 50;
+const BETWEEN_GAME_MS    = 3000;
+const GROWTH_RATE        = 0.06;
+const TOTAL_PLAYERS      = 6;     // ★ Always exactly 6 visible players per round
+const MIN_WITHDRAWAL     = 5000;  // ★ Minimum withdrawal in MMK
+
+// ─── Round counter (used for bot identity rotation) ───────────────────────────
+let roundCounter = 0;
 
 // ─── Game state ───────────────────────────────────────────────────────────────
-/**
- * phase: 'idle' | 'countdown' | 'running' | 'crashed'
- *
- * KEY DESIGN:
- *  • gameId is generated at the START of countdown so bets reference it.
- *  • gameState.bets (Map) is NEVER reset between countdown and running;
- *    it only clears at the very start of a new countdown cycle.
- *  • startNewGame() copies the countdown bets map reference — no data loss.
- */
-const createFreshState = () => ({
-  phase:             'idle',      // 'countdown' | 'running' | 'crashed'
-  gameId:            null,
-  crashPoint:        0,
-  currentMultiplier: 1.0,
-  startTime:         null,
-  bets:              new Map(),   // userId → bet object — lives across countdown→running
-  totalBetsAmount:   0,
-  history:           [],
-});
 
 let G = createFreshState();
 
-// ─── Bot users ────────────────────────────────────────────────────────────────
-
-const BOT_USERS = [
-  { id: 'bot1',  username: 'U Thu Ha',      balance: 5000, strategy: 'early'  },
-  { id: 'bot2',  username: 'Kyaw Kyaw',     balance: 3000, strategy: 'medium' },
-  { id: 'bot3',  username: 'Ma Ma Lay',     balance: 7000, strategy: 'late'   },
-  { id: 'bot4',  username: 'Ko Ko Gyi',     balance: 2500, strategy: 'random' },
-  { id: 'bot5',  username: 'Daw Hla',       balance: 4500, strategy: 'early'  },
-  { id: 'bot6',  username: 'Mg Mg Aung',    balance: 6000, strategy: 'medium' },
-  { id: 'bot7',  username: 'Su Su Hlaing',  balance: 3500, strategy: 'late'   },
-  { id: 'bot8',  username: 'Zaw Zaw',       balance: 8000, strategy: 'random' },
-  { id: 'bot9',  username: 'Aye Aye',       balance: 2800, strategy: 'early'  },
-  { id: 'bot10', username: 'Phyo Phyo',     balance: 5200, strategy: 'medium' },
-];
-
-// ─── Crash point generator ────────────────────────────────────────────────────
-
-function generateCrashPoint(totalBets) {
-  let cp;
-  if      (totalBets > 10000) cp = 1.1 + Math.random() * 0.9;
-  else if (totalBets > 5000)  cp = 1.2 + Math.random() * 2.8;
-  else if (totalBets > 2000)  cp = 1.5 + Math.random() * 5.5;
-  else                         cp = Math.random() < 0.3
-                                      ? 5  + Math.random() * 15
-                                      : 1.1 + Math.random() * 3.9;
-  return Math.min(20.0, Math.round(cp * 100) / 100);
+function createFreshState() {
+  return {
+    phase:             'idle',
+    gameId:            null,
+    crashPoint:        0,
+    currentMultiplier: 1.0,
+    startTime:         null,
+    bets:              new Map(),
+    totalBetsAmount:   0,
+    totalUserBets:     0,   // ★ real-user bets only (for crash algorithm)
+    maxSingleUserBet:  0,   // ★ highest single real-user bet
+    history:           [],
+  };
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-function generateGameId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-// ─── activeBets snapshot (for socket broadcast) ───────────────────────────────
+const sleep        = ms => new Promise(r => setTimeout(r, ms));
+const generateGameId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 function activeBetsSnapshot() {
-  return Array.from(G.bets.values())
-    .filter(b => !b.cashedAt)
-    .map(b => ({ username: b.username, amount: b.amount, isBot: b.isBot }));
+  const out = [];
+  for (const b of G.bets.values()) {
+    if (!b.cashedAt) out.push({ username: b.username, amount: b.amount, isBot: b.isBot });
+  }
+  return out;
 }
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 //  GAME LOOP
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function startGameLoop() {
   console.log('🎮 Game loop started');
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
       await runCountdown();
       await runGame();
-      // brief pause so clients can see crash screen
       await sleep(BETWEEN_GAME_MS);
     } catch (err) {
       console.error('🔥 Game loop error:', err);
-      await sleep(2000); // prevent tight error loop
+      await sleep(2000);
     }
   }
 }
@@ -226,30 +359,31 @@ async function startGameLoop() {
 // ─── Phase 1: Countdown ───────────────────────────────────────────────────────
 
 async function runCountdown() {
-  // Reset only the bet map and amounts — history is kept
-  G.bets            = new Map();   // ← fresh map for this round
-  G.totalBetsAmount = 0;
-  G.currentMultiplier = 1.0;
-  G.phase           = 'countdown';
+  roundCounter++;
 
-  // ★ Generate gameId NOW so bets placed during countdown get the right gameId
-  G.gameId     = generateGameId();
-  G.crashPoint = 0; // will be finalised at game start
+  // Reset state — keep history
+  G.bets               = new Map();
+  G.totalBetsAmount    = 0;
+  G.totalUserBets      = 0;
+  G.maxSingleUserBet   = 0;
+  G.currentMultiplier  = 1.0;
+  G.phase              = 'countdown';
+  G.gameId             = generateGameId();
+  G.crashPoint         = 0;
 
-  io.emit('countdown', {
-    seconds: COUNTDOWN_SECONDS,
-    gameId:  G.gameId,
-  });
+  io.emit('countdown', { seconds: COUNTDOWN_SECONDS, gameId: G.gameId });
 
-  // Place bot bets during countdown window (after a short delay)
-  setTimeout(placeBotBets, 800);
+  // Place bot bets after a short human-like delay
+  setTimeout(placeBotBets, 600 + Math.floor(Math.random() * 800));
 
-  // Wait the full countdown
   await sleep(COUNTDOWN_SECONDS * 1000);
 
-  // Finalise crash point now that all bets are in
-  G.crashPoint = generateCrashPoint(G.totalBetsAmount);
-  console.log(`🎲 Game ${G.gameId} — crash @ ${G.crashPoint}x | bets: ${G.totalBetsAmount} MMK`);
+  // ★ Crash point determined NOW using real user bet data
+  G.crashPoint = calculateCrashPoint(G.totalUserBets, G.maxSingleUserBet);
+  console.log(
+    `🎲 Round ${roundCounter} | game=${G.gameId} | crash@${G.crashPoint}x` +
+    ` | userBets=${G.totalUserBets} | maxSingle=${G.maxSingleUserBet} | house=${houseBalance}`
+  );
 }
 
 // ─── Phase 2: Running ─────────────────────────────────────────────────────────
@@ -258,19 +392,15 @@ async function runGame() {
   G.phase     = 'running';
   G.startTime = Date.now();
 
-  // ★ DO NOT reset G.bets here — carry forward bets from countdown
   io.emit('gameStart', {
-    gameId:     G.gameId,
-    crashPoint: G.crashPoint,               // optional: remove if you don't want to reveal
-    bets:       activeBetsSnapshot(),
+    gameId: G.gameId,
+    bets:   activeBetsSnapshot(),
   });
 
-  // Multiplier loop — 50ms ticks
   while (G.phase === 'running') {
     const elapsed = (Date.now() - G.startTime) / 1000;
-    // Exponential growth: e^(rate * t)
-    const mult = Math.pow(Math.E, GROWTH_RATE * elapsed);
-    G.currentMultiplier = Math.round(mult * 100) / 100;
+    const mult    = Math.pow(Math.E, GROWTH_RATE * elapsed);
+    G.currentMultiplier = round2(mult);
 
     if (G.currentMultiplier >= G.crashPoint) {
       G.currentMultiplier = G.crashPoint;
@@ -291,16 +421,27 @@ async function crashGame() {
   G.phase = 'crashed';
   console.log(`💥 Crashed @ ${G.crashPoint}x`);
 
-  // Process all bets that weren't cashed out
+  // Calculate house profit/loss for this round
+  let roundProfit = 0;
   const lossPromises = [];
+
   for (const [uid, bet] of G.bets.entries()) {
     if (!bet.cashedAt) {
+      // House wins this bet
+      if (!bet.isBot) roundProfit += bet.amount;
       lossPromises.push(processBetLoss(uid, bet));
+    } else if (!bet.isBot) {
+      // House paid this out
+      roundProfit -= bet.profit ?? 0;
     }
   }
-  await Promise.allSettled(lossPromises); // don't let one failure block others
 
-  // Push to history (keep last 50)
+  await Promise.allSettled(lossPromises);
+
+  // Update house balance
+  houseBalance += roundProfit;
+  if (houseBalance < 0) houseBalance = 0;
+
   G.history.unshift({
     gameId:     G.gameId,
     crashPoint: G.crashPoint,
@@ -309,40 +450,26 @@ async function crashGame() {
   });
   if (G.history.length > 50) G.history.length = 50;
 
-  io.emit('gameCrashed', {
-    multiplier: G.crashPoint,
-    gameId:     G.gameId,
-  });
+  io.emit('gameCrashed', { multiplier: G.crashPoint, gameId: G.gameId });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  PLACE BET  — called during countdown only
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  PLACE BET
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function placeBet(userId, username, amount) {
-  // ── Phase guard ────────────────────────────────────────────────
   if (G.phase !== 'countdown') {
     return { success: false, message: G.phase === 'running'
       ? 'ဂိမ်းစပြီးပါပြီ — နောက်ပတ်တွင် Bet လောင်းပါ'
       : 'Countdown မစသေးပါ' };
   }
+  if (G.bets.has(userId))  return { success: false, message: 'ဤပတ်တွင် Bet လောင်းပြီးပါပြီ' };
 
-  // ── Duplicate guard ────────────────────────────────────────────
-  if (G.bets.has(userId)) {
-    return { success: false, message: 'ဤပတ်တွင် Bet လောင်းပြီးပါပြီ' };
-  }
-
-  // ── Amount guard ───────────────────────────────────────────────
   amount = Number(amount);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return { success: false, message: 'ငွေပမာဏ မမှန်ကန်' };
-  }
-
-  // ── DB guard ───────────────────────────────────────────────────
+  if (!Number.isFinite(amount) || amount <= 0) return { success: false, message: 'ငွေပမာဏ မမှန်ကန်' };
   if (!dbReady) return { success: false, message: 'Server မသင့်တော်သေးပါ' };
 
   try {
-    // Atomic balance deduction: only deduct if balance is sufficient
     const user = await User.findOneAndUpdate(
       { telegramId: userId, balance: { $gte: amount }, isBanned: false },
       { $inc: { balance: -amount, totalBets: 1 }, $set: { lastActive: new Date() } },
@@ -350,33 +477,26 @@ async function placeBet(userId, username, amount) {
     );
 
     if (!user) {
-      // Distinguish between "not found", "banned", or "insufficient balance"
-      const existing = await User.findOne({ telegramId: userId });
-      if (!existing)        return { success: false, message: 'User not found' };
-      if (existing.isBanned) return { success: false, message: 'Account banned' };
+      const ex = await User.findOne({ telegramId: userId });
+      if (!ex)          return { success: false, message: 'User not found' };
+      if (ex.isBanned)  return { success: false, message: 'Account banned' };
       return { success: false, message: 'လက်ကျန်မလုံလောက်' };
     }
 
-    // ★ Register bet in the SAME Map that runGame() will use
     const bet = {
-      userId,
-      username,
-      amount,
-      isBot:    false,
-      gameId:   G.gameId,   // gameId was set at countdown start ✓
-      placedAt: Date.now(),
-      cashedAt: null,
-      cashoutMultiplier: null,
-      profit:   null,
+      userId, username, amount,
+      isBot: false, gameId: G.gameId,
+      placedAt: Date.now(), cashedAt: null,
+      cashoutMultiplier: null, profit: null,
     };
     G.bets.set(userId, bet);
-    G.totalBetsAmount += amount;
+    G.totalBetsAmount  += amount;
+    G.totalUserBets    += amount;              // ★ track real-user pool
+    if (amount > G.maxSingleUserBet) G.maxSingleUserBet = amount;  // ★ high-roller tracking
 
-    // Fire-and-forget DB write (non-blocking)
     Bet.create({ userId, username, amount, gameId: G.gameId, status: 'pending' })
        .catch(e => console.error('Bet.create error:', e));
 
-    // Broadcast
     io.emit('balanceUpdate', { userId, balance: user.balance });
     io.emit('activeBets',    { bets: activeBetsSnapshot() });
 
@@ -387,44 +507,36 @@ async function placeBet(userId, username, amount) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  CASH OUT  — strict validation, no double-spend
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  CASH OUT — strict phase guard (latency check)
+// ═══════════════════════════════════════════════════════════════════════════
 
 async function cashOut(userId, clientMultiplier, clientGameId) {
-  // ── Phase guard ────────────────────────────────────────────────
+  // ★ Strict latency check — if phase is not 'running', reject immediately
   if (G.phase !== 'running') {
     return { success: false, message: 'ဂိမ်း Crash ဖြစ်သွားပြီ — Cashout မရတော့ပါ' };
   }
 
-  // ── gameId guard (stale event protection) ──────────────────────
   if (clientGameId && clientGameId !== G.gameId) {
     return { success: false, message: 'Game session မမှန်ကန်' };
   }
 
-  // ── Bet guard ──────────────────────────────────────────────────
   const bet = G.bets.get(userId);
-  if (!bet)          return { success: false, message: 'Active bet မရှိပါ' };
-  if (bet.cashedAt)  return { success: false, message: 'ရပြီးသားဖြစ်သည် (Double cashout)' };
+  if (!bet)         return { success: false, message: 'Active bet မရှိပါ' };
+  if (bet.cashedAt) return { success: false, message: 'ရပြီးသားဖြစ်သည် (Double cashout)' };
 
-  // ── Mark cashed immediately (prevents concurrent double-spend) ─
-  bet.cashedAt = Date.now();   // ← set BEFORE async DB call
+  // Mark cashed BEFORE async — prevents concurrent double-spend
+  bet.cashedAt = Date.now();
 
-  // Use server-side multiplier (don't trust client fully — clamp to server value)
   const multiplier  = Math.min(
     parseFloat(clientMultiplier) || G.currentMultiplier,
-    G.currentMultiplier          // never allow cashout above current server mult
+    G.currentMultiplier
   );
-  const profit      = Math.round(bet.amount * (multiplier - 1) * 100) / 100;
+  const profit      = round2(bet.amount * (multiplier - 1));
   const totalReturn = bet.amount + profit;
 
   bet.cashoutMultiplier = multiplier;
   bet.profit            = profit;
-
-  if (!dbReady) {
-    // Still give winnings even if DB is down (reconcile later)
-    console.warn('⚠️  cashOut: DB not ready, processing in-memory only');
-  }
 
   try {
     const user = await User.findOneAndUpdate(
@@ -434,7 +546,6 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
     );
 
     if (user) {
-      // Non-blocking DB bet update
       Bet.findOneAndUpdate(
         { userId, gameId: G.gameId },
         { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }
@@ -444,48 +555,62 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
     }
 
     io.emit('betResult', {
-      success:     true,
-      type:        'cashout',
-      userId,
-      gameId:      G.gameId,
-      multiplier,
-      profit,
-      betAmount:   bet.amount,
-      totalReturn,
+      success: true, type: 'cashout',
+      userId, gameId: G.gameId,
+      multiplier, profit, betAmount: bet.amount, totalReturn,
     });
-
     io.emit('newHistory', {
-      username:   bet.username,
-      start:      1.0,
-      stop:       multiplier,
-      profit,
-      isBot:      false,
-      status:     'won',
+      username: bet.username, start: 1.0, stop: multiplier,
+      profit, isBot: false, status: 'won',
     });
-
     io.emit('activeBets', { bets: activeBetsSnapshot() });
 
     return { success: true, multiplier, profit, totalReturn, newBalance: user?.balance };
   } catch (err) {
     console.error('cashOut DB error:', err);
-    // bet.cashedAt is already set so no double-spend even on error
-    return { success: false, message: 'Server error — bet recorded locally' };
+    return { success: false, message: 'Server error' };
   }
 }
 
-// ─── Bot helpers ──────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  BOT SYSTEM — 6-Player Rule
+//  ★ No new bot objects created per round — reuse from BOT_POOL
+//  ★ Identity protection: rotate bots based on roundCounter
+// ═══════════════════════════════════════════════════════════════════════════
 
 function placeBotBets() {
   if (G.phase !== 'countdown') return;
 
-  const count    = 4 + Math.floor(Math.random() * 5);
-  const selected = [...BOT_USERS].sort(() => Math.random() - 0.5).slice(0, count);
+  // How many real users have already bet this round?
+  let realUserCount = 0;
+  for (const b of G.bets.values()) {
+    if (!b.isBot) realUserCount++;
+  }
+
+  const botsNeeded = Math.max(0, TOTAL_PLAYERS - realUserCount);
+  if (botsNeeded === 0) return;
+
+  // ★ Identity Protection: exclude bots used in the previous round
+  // Filter bots that didn't play last round (lastRound !== roundCounter - 1)
+  const freshBots = BOT_ARRAY.filter(b => b.lastRound !== roundCounter - 1);
+
+  // Pick botsNeeded unique bots with a shuffled fresh list
+  const selected = shuffleSlice(
+    freshBots.length >= botsNeeded ? freshBots : BOT_ARRAY,
+    botsNeeded
+  );
 
   selected.forEach(bot => {
-    const amount = Math.floor(Math.random() * 900) + 100;
-    if (bot.balance < amount) return;
+    const minBet = 200;
+    const maxBet = Math.min(1500, bot.balance);
+    if (bot.balance < minBet) {
+      bot.balance = 5000; // Replenish exhausted bots
+    }
+    const amount = minBet + Math.floor(Math.random() * (maxBet - minBet));
 
-    bot.balance -= amount;
+    bot.balance   -= amount;
+    bot.lastRound  = roundCounter;  // ★ mark as used this round
+
     G.bets.set(bot.id, {
       userId:            bot.id,
       username:          bot.username,
@@ -501,8 +626,11 @@ function placeBotBets() {
     G.totalBetsAmount += amount;
   });
 
+  console.log(`🤖 Round ${roundCounter}: ${realUserCount} real user(s) + ${selected.length} bots = ${realUserCount + selected.length} players`);
   io.emit('activeBets', { bets: activeBetsSnapshot() });
 }
+
+// ─── Bot cashout processing ───────────────────────────────────────────────────
 
 function processBotCashouts() {
   for (const [uid, bet] of G.bets.entries()) {
@@ -511,65 +639,78 @@ function processBotCashouts() {
     const m = G.currentMultiplier;
     let shouldCash = false;
 
+    // Bots cash out more conservatively when crash point is low
+    // (they "know" the game is rigged — simulates smart bot behaviour)
+    const isLowCrash = G.crashPoint <= 1.5;
+
     switch (bet.strategy) {
-      case 'early':  shouldCash = m > 1.3 && m < 2.0  && Math.random() < 0.25; break;
-      case 'medium': shouldCash = m > 2.0 && m < 5.0  && Math.random() < 0.18; break;
-      case 'late':   shouldCash = m > 5.0 && m < 10.0 && Math.random() < 0.12; break;
-      case 'random': shouldCash = Math.random() < 0.08; break;
+      case 'early':
+        shouldCash = isLowCrash
+          ? m > 1.05 && m < 1.25 && Math.random() < 0.50
+          : m > 1.20 && m < 2.00 && Math.random() < 0.25;
+        break;
+      case 'medium':
+        shouldCash = isLowCrash
+          ? m > 1.10 && m < 1.35 && Math.random() < 0.40
+          : m > 2.00 && m < 5.00 && Math.random() < 0.18;
+        break;
+      case 'late':
+        shouldCash = isLowCrash
+          ? m > 1.15 && Math.random() < 0.35
+          : m > 5.00 && m < 10.0 && Math.random() < 0.12;
+        break;
+      case 'random':
+        shouldCash = Math.random() < (isLowCrash ? 0.15 : 0.08);
+        break;
     }
 
     if (!shouldCash) continue;
 
-    const profit = Math.round(bet.amount * (m - 1) * 100) / 100;
+    const profit = round2(bet.amount * (m - 1));
     bet.cashedAt          = Date.now();
     bet.cashoutMultiplier = m;
     bet.profit            = profit;
 
-    const botUser = BOT_USERS.find(b => b.id === uid);
-    if (botUser) botUser.balance += bet.amount + profit;
+    // Update bot balance in pool (reuse object)
+    const botObj = BOT_POOL.get(uid);
+    if (botObj) botObj.balance += bet.amount + profit;
 
     io.emit('newHistory', {
-      username: bet.username,
-      start:    1.0,
-      stop:     m,
-      profit,
-      isBot:    true,
-      status:   'won',
+      username: bet.username, start: 1.0, stop: m,
+      profit, isBot: true, status: 'won',
     });
     io.emit('activeBets', { bets: activeBetsSnapshot() });
   }
 }
 
-// ─── Process bet loss on crash ────────────────────────────────────────────────
+// ─── Process bet loss ──────────────────────────────────────────────────────────
 
 async function processBetLoss(userId, bet) {
   if (!bet.isBot) {
     Bet.findOneAndUpdate(
-      { userId, gameId: G.gameId },
-      { status: 'lost' }
-    ).catch(e => console.error('BetLoss update error:', e));
+      { userId, gameId: G.gameId }, { status: 'lost' }
+    ).catch(e => console.error('BetLoss error:', e));
+  } else {
+    // Replenish bot balance so it never runs dry
+    const botObj = BOT_POOL.get(userId);
+    if (botObj && botObj.balance < 1000) botObj.balance += 3000;
   }
 
   io.emit('newHistory', {
-    username: bet.username,
-    start:    1.0,
-    stop:     G.crashPoint,
-    profit:   -bet.amount,
-    isBot:    bet.isBot,
-    status:   'lost',
+    username: bet.username, start: 1.0, stop: G.crashPoint,
+    profit: -bet.amount, isBot: bet.isBot, status: 'lost',
   });
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  SOCKET.IO  — connection handler
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+//  SOCKET.IO
+// ═══════════════════════════════════════════════════════════════════════════
 
 io.on('connection', (socket) => {
   const userId = socket.handshake.query.userId || null;
   socket.userId = userId;
-  console.log(`🟢 Connect [${socket.id}] uid=${userId}`);
+  console.log(`🟢 [${socket.id}] uid=${userId}`);
 
-  // Send current state to newly connected client
   socket.emit('gameState', {
     phase:      G.phase,
     gameId:     G.gameId,
@@ -578,144 +719,109 @@ io.on('connection', (socket) => {
   });
   socket.emit('activeBets', { bets: activeBetsSnapshot() });
 
-  // If game is mid-run, also send a multiplier so client syncs immediately
   if (G.phase === 'running') {
     socket.emit('multiplier', { multiplier: G.currentMultiplier, phase: 'running' });
   }
 
-  // ── placeBet ──────────────────────────────────────────────────
   socket.on('placeBet', async (data, cb) => {
     if (typeof cb !== 'function') return;
     if (!data?.userId || !data?.username || !data?.amount) {
       return cb({ success: false, message: 'Invalid payload' });
     }
-    const result = await placeBet(
-      String(data.userId),
-      String(data.username),
-      Number(data.amount)
-    );
-    cb(result);
+    cb(await placeBet(String(data.userId), String(data.username), Number(data.amount)));
   });
 
-  // ── cashOut ───────────────────────────────────────────────────
   socket.on('cashOut', async (data, cb) => {
     if (typeof cb !== 'function') return;
     if (!data?.userId) return cb({ success: false, message: 'Invalid payload' });
-    const result = await cashOut(
-      String(data.userId),
-      data.multiplier,
-      data.gameId
-    );
-    cb(result);
+    cb(await cashOut(String(data.userId), data.multiplier, data.gameId));
   });
 
-  // ── authenticate ──────────────────────────────────────────────
   socket.on('authenticate', (data) => {
     if (data?.userId) socket.userId = String(data.userId);
   });
 
-  // ── disconnect ────────────────────────────────────────────────
   socket.on('disconnect', (reason) => {
-    console.log(`🔴 Disconnect [${socket.id}] uid=${socket.userId} reason=${reason}`);
-    // No cleanup needed — bet state lives in G.bets (server-side Map)
+    console.log(`🔴 [${socket.id}] uid=${socket.userId} ${reason}`);
   });
 
-  socket.on('error', (err) => {
-    console.error(`Socket error [${socket.id}]:`, err.message);
-  });
+  socket.on('error', (err) => console.error(`Socket err [${socket.id}]:`, err.message));
 });
 
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 //  API ROUTES
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
 app.post('/api/auth', async (req, res) => {
   try {
     const { id, username, first_name, last_name } = req.body;
     if (!id) return res.status(400).json({ success: false, message: 'Missing id' });
-
     const tid = String(id);
     let user  = await User.findOne({ telegramId: tid });
-
     if (!user) {
-      user = await User.create({
-        telegramId: tid, username,
-        firstName: first_name, lastName: last_name,
-        balance: 1000,
-      });
+      user = await User.create({ telegramId: tid, username, firstName: first_name, lastName: last_name, balance: 1000 });
     } else {
       if (user.isBanned) return res.json({ success: false, banned: true, message: 'Banned' });
       user.lastActive = new Date();
       await user.save();
     }
-
-    res.json({
-      success: true,
-      user: {
-        id:             user.telegramId,
-        username:       user.username,
-        balance:        user.balance,
-        totalDeposited: user.totalDeposited,
-        totalWithdrawn: user.totalWithdrawn,
-      },
-    });
+    res.json({ success: true, user: {
+      id: user.telegramId, username: user.username,
+      balance: user.balance, totalDeposited: user.totalDeposited, totalWithdrawn: user.totalWithdrawn,
+    }});
   } catch (err) {
-    console.error('auth error:', err);
+    console.error('auth:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// ── Deposit ───────────────────────────────────────────────────────────────────
 app.post('/api/deposit', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
     if (!userId || !name || !phone || !amount || Number(amount) < 3000) {
       return res.status(400).json({ success: false, message: 'Invalid data or amount < 3000' });
     }
-    await Transaction.create({
-      userId, username, type: 'deposit',
-      amount: Number(amount), accountName: name, accountNumber: phone,
-    });
-    res.json({ success: true, message: 'Deposit request received' });
+    await Transaction.create({ userId, username, type: 'deposit', amount: Number(amount), accountName: name, accountNumber: phone });
+    res.json({ success: true });
   } catch (err) {
-    console.error('deposit error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// ── Withdraw (immediate balance deduction) ────────────────────────────────────
+// ★ Withdraw — Minimum 5,000 MMK
 app.post('/api/withdraw', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
     const amt = Number(amount);
+
     if (!userId || !name || !phone || !amt || amt <= 0) {
       return res.status(400).json({ success: false, message: 'Invalid data' });
     }
 
-    // Atomic deduction
+    // ★ Minimum withdrawal enforcement
+    if (amt < MIN_WITHDRAWAL) {
+      return res.status(400).json({
+        success: false,
+        message: `အနည်းဆုံး ${MIN_WITHDRAWAL.toLocaleString()} MMK ထုတ်ရမည်`,
+      });
+    }
+
     const user = await User.findOneAndUpdate(
       { telegramId: userId, balance: { $gte: amt } },
       { $inc: { balance: -amt, totalWithdrawn: amt } },
       { new: true }
     );
     if (!user) {
-      const exists = await User.findOne({ telegramId: userId });
-      return res.status(400).json({
-        success: false,
-        message: exists ? 'လက်ကျန်မလုံလောက်' : 'User not found',
-      });
+      const ex = await User.findOne({ telegramId: userId });
+      return res.status(400).json({ success: false, message: ex ? 'လက်ကျန်မလုံလောက်' : 'User not found' });
     }
 
-    await Transaction.create({
-      userId, username, type: 'withdraw',
-      amount: amt, accountName: name, accountNumber: phone,
-    });
+    await Transaction.create({ userId, username, type: 'withdraw', amount: amt, accountName: name, accountNumber: phone });
 
     io.emit('balanceUpdate', { userId, balance: user.balance });
-    res.json({ success: true, newBalance: user.balance, message: 'Withdraw request received' });
+    res.json({ success: true, newBalance: user.balance });
   } catch (err) {
-    console.error('withdraw error:', err);
+    console.error('withdraw:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
@@ -724,60 +830,41 @@ app.post('/api/withdraw', async (req, res) => {
 
 function adminGuard(req, res, next) {
   const id = req.headers['x-telegram-id'];
-  if (!id || !ADMIN_IDS.includes(id)) {
-    return res.status(403).json({ success: false, message: 'Unauthorized' });
-  }
+  if (!id || !ADMIN_IDS.includes(id)) return res.status(403).json({ success: false, message: 'Unauthorized' });
   next();
 }
 
-// ── Admin: list users ─────────────────────────────────────────────────────────
 app.get('/api/admin/users', adminGuard, async (req, res) => {
-  try {
-    const users = await User.find().sort({ createdAt: -1 }).limit(200).lean();
-    res.json({ success: true, users });
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+  try { res.json({ success: true, users: await User.find().sort({ createdAt: -1 }).limit(200).lean() }); }
+  catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// ── Admin: list transactions ──────────────────────────────────────────────────
 app.get('/api/admin/transactions', adminGuard, async (req, res) => {
-  try {
-    const transactions = await Transaction.find().sort({ createdAt: -1 }).limit(200).lean();
-    res.json({ success: true, transactions });
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+  try { res.json({ success: true, transactions: await Transaction.find().sort({ createdAt: -1 }).limit(200).lean() }); }
+  catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// ── Admin: adjust balance ─────────────────────────────────────────────────────
 app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
   try {
     const { userId, action, amount } = req.body;
     const amt = Number(amount);
     if (!userId || !action || !amt) return res.status(400).json({ success: false, message: 'Missing fields' });
-
-    let update;
+    let user;
     if (action === 'add') {
-      update = { $inc: { balance: amt, totalDeposited: amt } };
+      user = await User.findOneAndUpdate({ telegramId: userId }, { $inc: { balance: amt, totalDeposited: amt } }, { new: true });
     } else if (action === 'deduct') {
-      // Only deduct if sufficient balance
-      const u = await User.findOneAndUpdate(
+      user = await User.findOneAndUpdate(
         { telegramId: userId, balance: { $gte: amt } },
-        { $inc: { balance: -amt, totalWithdrawn: amt } },
-        { new: true }
+        { $inc: { balance: -amt, totalWithdrawn: amt } }, { new: true }
       );
-      if (!u) return res.status(400).json({ success: false, message: 'Insufficient balance' });
-      io.emit('balanceUpdate', { userId, balance: u.balance });
-      return res.json({ success: true, balance: u.balance });
-    } else {
-      return res.status(400).json({ success: false, message: 'Invalid action' });
-    }
-
-    const user = await User.findOneAndUpdate({ telegramId: userId }, update, { new: true });
+      if (!user) return res.status(400).json({ success: false, message: 'Insufficient balance' });
+    } else return res.status(400).json({ success: false, message: 'Invalid action' });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     io.emit('balanceUpdate', { userId, balance: user.balance });
     res.json({ success: true, balance: user.balance });
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+  } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// ── Admin: ban/unban ──────────────────────────────────────────────────────────
 app.post('/api/admin/user/ban', adminGuard, async (req, res) => {
   try {
     const { userId, ban, reason } = req.body;
@@ -787,76 +874,82 @@ app.post('/api/admin/user/ban', adminGuard, async (req, res) => {
     const user = await User.findOneAndUpdate({ telegramId: userId }, update);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+  } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
-// ── Admin: process transaction ────────────────────────────────────────────────
 app.post('/api/admin/transaction/process', adminGuard, async (req, res) => {
   try {
     const { transactionId, status, adminNote } = req.body;
     const tx = await Transaction.findById(transactionId);
-    if (!tx) return res.status(404).json({ success: false, message: 'Transaction not found' });
+    if (!tx) return res.status(404).json({ success: false, message: 'Not found' });
     if (tx.status !== 'pending') return res.status(400).json({ success: false, message: 'Already processed' });
 
     if (status === 'confirmed' && tx.type === 'deposit') {
-      const user = await User.findOneAndUpdate(
+      const u = await User.findOneAndUpdate(
         { telegramId: tx.userId },
         { $inc: { balance: tx.amount, totalDeposited: tx.amount } },
         { new: true }
       );
-      if (user) io.emit('balanceUpdate', { userId: tx.userId, balance: user.balance });
+      if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
     }
-
     if (status === 'rejected' && tx.type === 'withdraw') {
-      // Refund
-      const user = await User.findOneAndUpdate(
+      const u = await User.findOneAndUpdate(
         { telegramId: tx.userId },
         { $inc: { balance: tx.amount, totalWithdrawn: -tx.amount } },
         { new: true }
       );
-      if (user) {
-        io.emit('balanceUpdate', { userId: tx.userId, balance: user.balance });
-        console.log(`↩️  Withdraw rejected — refunded ${tx.amount} → ${tx.userId}`);
-      }
+      if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
     }
 
-    tx.status      = status;
-    tx.adminNote   = adminNote || '';
-    tx.confirmedBy = req.headers['x-telegram-id'];
-    tx.confirmedAt = new Date();
+    tx.status = status; tx.adminNote = adminNote || '';
+    tx.confirmedBy = req.headers['x-telegram-id']; tx.confirmedAt = new Date();
     await tx.save();
-
     res.json({ success: true });
   } catch (err) {
-    console.error('process tx error:', err);
+    console.error('tx process:', err);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────────
+// ── Admin: house stats ─────────────────────────────────────────────────────────
+app.get('/api/admin/house', adminGuard, (req, res) => {
+  res.json({
+    success: true,
+    houseBalance,
+    round: roundCounter,
+    phase: G.phase,
+    bets:  G.bets.size,
+    botPoolSize: BOT_POOL.size,
+  });
+});
+
+// ── Admin: set house balance (for testing pressure mode) ───────────────────────
+app.post('/api/admin/house/balance', adminGuard, (req, res) => {
+  const amt = Number(req.body.amount);
+  if (!Number.isFinite(amt) || amt < 0) return res.status(400).json({ success: false });
+  houseBalance = amt;
+  console.log(`Admin set houseBalance → ${houseBalance}`);
+  res.json({ success: true, houseBalance });
+});
+
+// ── Health check ───────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  phase:  G.phase,
-  gameId: G.gameId,
-  bets:   G.bets.size,
-  db:     dbReady,
+  status: 'ok', phase: G.phase, gameId: G.gameId,
+  round: roundCounter, bots: BOT_POOL.size, db: dbReady, house: houseBalance,
 }));
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── Start ─────────────────────────────────────────────────────────────────────
 
 startGameLoop();
 
 if (process.env.BOT_TOKEN) {
-  bot.launch()
-     .then(() => console.log('🤖 Telegram bot started'))
-     .catch(err => console.error('Bot launch error:', err));
+  bot.launch().then(() => console.log('🤖 Bot started')).catch(console.error);
 }
 
 const PORT = Number(process.env.PORT) || 3000;
-server.listen(PORT, () => console.log(`🚀 Server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
 
-const shutdown = (sig) => {
-  console.log(`\n${sig} received — shutting down`);
+const shutdown = sig => {
   bot.stop(sig);
   server.close(() => mongoose.disconnect().then(() => process.exit(0)));
 };
