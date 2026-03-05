@@ -363,7 +363,7 @@ bot.start(async (ctx) => {
   }
 });
 
-// /admin — admin only → admin panel button
+// /admin — admin only → admin panel as Telegram Mini App (webApp button)
 bot.command('admin', async (ctx) => {
   const tid = String(ctx.from.id);
   if (!ADMIN_IDS.includes(tid)) {
@@ -372,7 +372,7 @@ bot.command('admin', async (ctx) => {
   await ctx.replyWithHTML(
     `🔐 <b>Admin Panel</b>\n\nAdmin menu ကိုဝင်ရောက်ရန် အောက်ပါ button ကိုနှိပ်ပါ။`,
     Markup.inlineKeyboard([
-      [Markup.button.url('⚙️ Admin Panel ဝင်ရန်', ADMIN_PANEL_URL)],
+      [Markup.button.webApp('⚙️ Admin Panel ဝင်ရန်', ADMIN_PANEL_URL)],
     ])
   );
 });
@@ -728,6 +728,12 @@ function adminGuard(req, res, next) {
   if (!id || !ADMIN_IDS.includes(id)) return res.status(403).json({ success: false, message: 'Unauthorized' });
   next();
 }
+
+// Admin — check if user is admin (used by admin.html on load)
+app.get('/api/admin/check', (req, res) => {
+  const id = req.headers['x-telegram-id'];
+  res.json({ isAdmin: !!(id && ADMIN_IDS.includes(id)) });
+});
 
 // Admin — users list
 app.get('/api/admin/users', adminGuard, async (req, res) => {
