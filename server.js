@@ -347,6 +347,8 @@ bot.start(async (ctx) => {
         `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
         Markup.inlineKeyboard([
           [Markup.button.webApp('🎮 Play Now', GAME_URL)],
+          [Markup.button.url('💌 Channel Join ရန် 💌', 'https://t.me/EzMoneyPayy')],
+          [Markup.button.url('💌 Customer Service 💌', 'https://t.me/EzMoneyyadmin')],
         ])
       );
     } else {
@@ -355,6 +357,8 @@ bot.start(async (ctx) => {
         `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
         Markup.inlineKeyboard([
           [Markup.button.webApp('🎮 Play Now', GAME_URL)],
+          [Markup.button.url('💌 Channel Join ရန် 💌', 'https://t.me/EzMoneyPayy')],
+          [Markup.button.url('💌 Customer Service 💌', 'https://t.me/EzMoneyyadmin')],
         ])
       );
     }
